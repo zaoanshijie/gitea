@@ -15,6 +15,7 @@ import (
 
 	"gitea.dev/modules/egress/policy"
 	"gitea.dev/modules/proxy"
+	"gitea.dev/modules/proxy/launcher"
 	"gitea.dev/modules/setting"
 
 	"golang.org/x/net/http/httpproxy"
@@ -46,6 +47,12 @@ func gitProxySelector() (func(*http.Request) (*url.URL, error), error) {
 	}
 	if setting.Proxy.Enabled && setting.Proxy.ProxyURL != "" {
 		return proxy.Proxy(), nil
+	}
+	// The on-demand proxy agent sits below the explicit operator settings and
+	// above the ambient environment: an unset or invalid agent configuration
+	// leaves the official behaviour untouched.
+	if launcher.Enabled() {
+		return launcher.ProxyFor, nil
 	}
 	allProxy := cmp.Or(os.Getenv("all_proxy"), os.Getenv("ALL_PROXY"))
 	env.HTTPProxy, env.HTTPSProxy = cmp.Or(env.HTTPProxy, allProxy), cmp.Or(env.HTTPSProxy, allProxy)

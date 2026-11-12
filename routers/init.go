@@ -17,6 +17,7 @@ import (
 	"gitea.dev/modules/log"
 	"gitea.dev/modules/markup"
 	"gitea.dev/modules/markup/external"
+	"gitea.dev/modules/proxy/launcher"
 	"gitea.dev/modules/setting"
 	"gitea.dev/modules/ssh"
 	"gitea.dev/modules/storage"
@@ -147,6 +148,7 @@ func InitWebInstalled(ctx context.Context) {
 	mustInit(packages_spec.InitManager)
 
 	// Booting long running goroutines.
+	launcher.Init(ctx)                     // reads GITEA_PROXY_AGENT_* only, a no-op when unset
 	mustInitCtx(ctx, gitproxy_service.Run) // must start before mirror/migration services spawn git
 	mustInit(indexer_service.Init)
 
