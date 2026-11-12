@@ -141,10 +141,14 @@ SHA256SUMS
 | `sha256sum -c SHA256SUMS` | 4 个全部 OK |
 | ELF e_machine | amd64 `3e00`、arm64 `b700` |
 | `gitea --version` | `gitea version 28.3.0 built with go1.27.4`（与官方同版本号） |
-| 首页 | HTTP 200，15742 字节，标题正确 |
+| 首页 | HTTP 200，15738 字节，标题正确 |
 | 静态资源 | `/assets/css/index.CqGlyyh2.css` → 200（`bindata` 已嵌入，单文件自包含） |
 | 启动 fatal | 0 |
 | 代理初始化 | `Proxy agent enabled: command=... listen=127.0.0.1:17890` |
+| 三配置启动矩阵 | 有效 / `COMMAND` 不存在 / 未设置，三者均 `Listen: http` 成功、`[F]` 计数 0 |
+
+> 二进制里内嵌了构建时的 VCS revision，同一个 tag 在不同提交上重建会得到不同的 sha256。
+> 校验时请以同一次 Release 里的 `SHA256SUMS` 为准，不要跨次构建比对。
 
 > 下载 arm64 时若出现 `sha256sum: FAILED`，先看文件大小是否与 Release 页面一致——
 > 大文件经代理传输可能被截断，断点续传重下即可，不是产物问题（已验证）。
