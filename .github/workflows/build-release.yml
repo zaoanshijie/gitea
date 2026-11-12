@@ -1,0 +1,109 @@
+name: build-release
+
+on:
+  push:
+    branches: [main, proxy-agent]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: build linux binaries
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: enable pnpm
+        run: |
+          corepack enable
+          pnpm --version
+
+      - name: install frontend dependencies
+        run: make node_modules
+
+      - name: build frontend
+        run: make frontend
+
+      - name: generate embedded assets
+        run: |
+          go generate -tags bindata \
+            ./modules/migration ./modules/options ./modules/public ./modules/templates
+
+      - name: build binaries
+        run: |
+          set -euo pipefail
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+            VERSION="${VERSION%-proxy*}"
+          else
+            VERSION="$(git describe --tags --always | sed 's/^v//')"
+          fi
+          echo "building version ${VERSION}"
+          mkdir -p dist
+          for arch in amd64 arm64; do
+            echo "::group::gitea linux/$arch"
+            CGO_ENABLED=0 GOOS=linux GOARCH="$arch" go build -trimpath \
+              -tags bindata \
+              -ldflags "-s -w -X main.Version=${VERSION}" \
+              -o "dist/gitea-${VERSION}-linux-${arch}" .
+            echo "::endgroup::"
+
+            echo "::group::gitea-proxy-agent linux/$arch"
+            CGO_ENABLED=0 GOOS=linux GOARCH="$arch" go build -trimpath \
+              -ldflags "-s -w" \
+              -o "dist/gitea-proxy-agent-${VERSION}-linux-${arch}" ./cmd/proxyagent
+            echo "::endgroup::"
+          done
+          cd dist && sha256sum ./* > SHA256SUMS && cat SHA256SUMS
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-binaries
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: publish release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: create release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          mkdir -p out && cp dist/release-binaries/* out/
+          ls -lh out
+          NOTES="Gitea with an on-demand proxy agent.
+
+          - gitea-*-linux-amd64 / linux-arm64: self-contained, frontend embedded
+          - gitea-proxy-agent-*-linux-amd64 / linux-arm64
+
+          Deployment and design notes live in docs/."
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$TAG" out/* --repo "$GITHUB_REPOSITORY" --clobber
+            gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --notes "$NOTES"
+          else
+            gh release create "$TAG" out/* --repo "$GITHUB_REPOSITORY" \
+              --title "$TAG" --notes "$NOTES"
+          fi
