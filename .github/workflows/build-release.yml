@@ -107,3 +107,7 @@ jobs:
             gh release create "$TAG" out/* --repo "$GITHUB_REPOSITORY" \
               --title "$TAG" --notes "$NOTES"
           fi
+
+          # tag 被移动过时 GitHub 会把关联 release 转为 draft（此时 /releases/tags 返回 404），
+          # 这里强制发布一次，保证 tag 与 release 都能正常访问。
+          gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false --latest --notes "$NOTES"
