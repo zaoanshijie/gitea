@@ -8,9 +8,10 @@
 | 项 | 值 |
 |---|---|
 | 基线版本 | `v28.3.0` |
-| 改动分支 | `proxy-agent` |
-| 提交数 | 4 个（launcher / agent / docs / ci） |
-| 改动文件 | 新增 2 个目录，修改 2 个文件 |
+| 改动分支 | `proxy-agent`（同时也是默认分支） |
+| 提交数 | 3 个（launcher / agent / docs+ci） |
+| 改动文件 | 新增 24 个，修改 2 个（`policies.go` +10 行、`init.go` +2 行） |
+| 上游 tag | 完整 264 个（fork 时由 GitHub 服务端同步） |
 
 查看相对基线的差异：
 
@@ -42,7 +43,7 @@ git remote add upstream https://github.com/go-gitea/gitea.git
 git fetch upstream --tags
 git checkout proxy-agent
 
-# 把 4 个提交挪到新 tag 上
+# 把改动提交整体挪到新 tag 上
 git rebase v28.4.0
 ```
 
@@ -82,7 +83,7 @@ tag 名必须是 `v<版本>-proxy.<序号>`，CI 会把它还原成 `<版本>` �
 
 ## 4. 同步主分支
 
-fork 的 `main` 现在与上游一致，直接在 GitHub 页面点 **Sync fork → Update branch** 即可，
+fork 的 `main` 与上游一致，直接在 GitHub 页面点 **Sync fork → Update branch** 即可，
 或者：
 
 ```bash
