@@ -103,6 +103,26 @@ func Init(ctx context.Context) {
 // Enabled reports whether a supervisor is installed.
 func Enabled() bool { return global.Load() != nil }
 
+// DialTimeout is how long one upstream dial may take while the on-demand proxy
+// is enabled.
+//
+// The first dial of a cold start also waits for the agent to fetch its
+// subscription, rank the nodes and measure a few of them, which regularly takes
+// 20-40s. Gitea's git proxy gives up after 30s by default and answers 504, so
+// the caller raises its dial timeout to this value. Zero means "keep the
+// official behaviour".
+func DialTimeout() time.Duration {
+	s := global.Load()
+	if s == nil {
+		return 0
+	}
+	d := s.cfg.StartTimeout + 15*time.Second
+	if d > 5*time.Minute {
+		d = 5 * time.Minute
+	}
+	return d
+}
+
 // Shutdown stops the proxy process if it is running.
 func Shutdown() {
 	if s := global.Swap(nil); s != nil {

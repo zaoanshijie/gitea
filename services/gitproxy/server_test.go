@@ -22,6 +22,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"gitea.dev/modules/egress/policy"
 	"gitea.dev/modules/git/gitcmd"
@@ -441,4 +442,29 @@ func TestRun(t *testing.T) {
 	_, stderr, runErr := gitcmd.NewCommand("clone", "-q", "--bare").AddDynamicArguments("git://127.0.0.2:"+port+"/repo1_bare", filepath.Join(base, "denied")).RunStdString(t.Context())
 	require.Error(t, runErr)
 	assert.Contains(t, stderr, "target denied by policy")
+}
+
+// TestSetDialTimeout documents the contract the on-demand launcher relies on:
+// the timeout may be raised, and a non-positive value keeps the official one.
+func TestSetDialTimeout(t *testing.T) {
+	originalDial, originalConnect := proxyDialer.Timeout, connectTimeout
+	t.Cleanup(func() {
+		proxyDialer.Timeout, connectTimeout = originalDial, originalConnect
+	})
+
+	proxyDialer.Timeout, connectTimeout = officialProxyDialTimeout, officialProxyDialTimeout
+	SetDialTimeout(90 * time.Second)
+	if proxyDialer.Timeout != 90*time.Second {
+		t.Errorf("dial timeout = %s, want 90s", proxyDialer.Timeout)
+	}
+	// The CONNECT handler has its own deadline; raising only the dialer would
+	// still cut a cold start off at the official 30s.
+	if connectTimeout != 90*time.Second {
+		t.Errorf("connect timeout = %s, want 90s", connectTimeout)
+	}
+
+	SetDialTimeout(0)
+	if proxyDialer.Timeout != 90*time.Second || connectTimeout != 90*time.Second {
+		t.Error("a non-positive value must be ignored")
+	}
 }

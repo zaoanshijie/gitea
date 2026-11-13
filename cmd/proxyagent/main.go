@@ -244,7 +244,6 @@ func bootBest(ctx context.Context, o options, layout paths, coreAddr string, ran
 	}
 
 	var (
-		best     *coreSession
 		bestNode Node
 		bestBps  int64 = -1 // -1: no measurement yet
 		haveBps  bool
@@ -252,8 +251,8 @@ func bootBest(ctx context.Context, o options, layout paths, coreAddr string, ran
 		lastErr  error
 
 		// A node that is reachable but could not be measured is remembered by
-		// value only. Keeping its core alive would hold the core port and make
-		// every later candidate fail to bind.
+		// value only, so a run without any measurement still has something to
+		// fall back on.
 		parkedNode *Node
 
 		probeURLs = o.probeURLs()
@@ -265,6 +264,10 @@ func bootBest(ctx context.Context, o options, layout paths, coreAddr string, ran
 	// job then fails anyway, just later and more expensively.
 	requireSpeed := o.requireSpeed && len(probeURLs) > 0 && o.speedWindow > 0
 
+	// The scan never keeps a core alive: every candidate is started, measured
+	// and stopped again. All cores bind the same port, so leaving one running
+	// while the next is probed would reject every later candidate. The winner
+	// is started once more below.
 	for i := 0; i < limit; i++ {
 		if ctx.Err() != nil {
 			log.Printf("selection budget reached after %d candidates", i)
@@ -298,8 +301,8 @@ func bootBest(ctx context.Context, o options, layout paths, coreAddr string, ran
 			}
 			if err != nil {
 				lastErr = err
-				log.Printf("candidate %s (rank %d/%d) rejected: %v", node, i+1, len(ranked), err)
 				sess.stop()
+				log.Printf("candidate %s (rank %d/%d) rejected: %v", node, i+1, len(ranked), err)
 				continue
 			}
 			if len(probeURLs) > 0 && o.speedWindow > 0 {
@@ -307,21 +310,14 @@ func bootBest(ctx context.Context, o options, layout paths, coreAddr string, ran
 			}
 			bps = 0
 		}
+		sess.stop()
 
-		// A measured candidate always wins and the fastest measurement wins.
-		// Everything else gives its core back: only one core may exist at a
-		// time, because they all bind the same port.
-		if measured && (!haveBps || bps > bestBps) {
-			if best != nil {
-				best.stop()
-			}
-			best, bestNode, bestBps, haveBps = sess, node, bps, true
-		} else {
-			if !measured && parkedNode == nil {
-				parked := node
-				parkedNode = &parked
-			}
-			sess.stop()
+		switch {
+		case measured && (!haveBps || bps > bestBps):
+			bestNode, bestBps, haveBps = node, bps, true
+		case !measured && parkedNode == nil:
+			parked := node
+			parkedNode = &parked
 		}
 
 		if o.minSpeed > 0 && haveBps && bestBps >= o.minSpeed {
@@ -333,35 +329,54 @@ func bootBest(ctx context.Context, o options, layout paths, coreAddr string, ran
 		}
 	}
 
-	if best == nil {
-		if requireSpeed && tried > 0 {
-			msg := fmt.Sprintf("no candidate moved any data from %s after %d candidate(s)", probeURLs[0], tried)
-			if lastErr != nil {
-				return nil, Node{}, fmt.Errorf("%s: %w", msg, lastErr)
-			}
-			return nil, Node{}, errors.New(msg)
+	if haveBps {
+		if o.minSpeed > 0 && bestBps < o.minSpeed {
+			log.Printf("no candidate reached %d KB/s, using the fastest anyway: %s at %d KB/s",
+				o.minSpeed/1024, bestNode, bestBps/1024)
 		}
-		if parkedNode != nil {
-			// Measurement was not conclusive but the node did answer; start it
-			// once more now that the port is free.
-			sess, err := boot(ctx, o, layout, coreAddr, *parkedNode)
-			if err != nil {
-				return nil, Node{}, err
-			}
-			log.Printf("using reachable node %s without a throughput measurement", *parkedNode)
-			return sess, *parkedNode, nil
+		sess, err := bootForServing(ctx, o, layout, coreAddr, bestNode)
+		if err != nil {
+			lastErr = err
+			log.Printf("the measured node %s could not be started again: %v", bestNode, err)
+		} else {
+			log.Printf("selected node %s (%d KB/s)", bestNode, bestBps/1024)
+			return sess, bestNode, nil
 		}
-		if lastErr == nil {
-			lastErr = errors.New("no candidate could be started")
-		}
-		return nil, Node{}, lastErr
 	}
-	if o.minSpeed > 0 && haveBps && bestBps >= 0 && bestBps < o.minSpeed {
-		log.Printf("no candidate reached %d KB/s, using the fastest anyway: %s at %d KB/s",
-			o.minSpeed/1024, bestNode, bestBps/1024)
+
+	if requireSpeed && tried > 0 && !haveBps {
+		msg := fmt.Sprintf("no candidate moved any data from %s after %d candidate(s)", probeURLs[0], tried)
+		if lastErr != nil {
+			return nil, Node{}, fmt.Errorf("%s: %w", msg, lastErr)
+		}
+		return nil, Node{}, errors.New(msg)
 	}
-	log.Printf("selected node %s (%d KB/s)", bestNode, bestBps/1024)
-	return best, bestNode, nil
+	if parkedNode != nil {
+		sess, err := bootForServing(ctx, o, layout, coreAddr, *parkedNode)
+		if err != nil {
+			return nil, Node{}, err
+		}
+		log.Printf("using reachable node %s without a throughput measurement", *parkedNode)
+		return sess, *parkedNode, nil
+	}
+	if lastErr == nil {
+		lastErr = errors.New("no candidate could be started")
+	}
+	return nil, Node{}, lastErr
+}
+
+// bootForServing starts the chosen node for real, after the scan.
+//
+// The selection budget may be nearly spent by now, which must not cost us a node
+// that was already proven to work, so the last start gets its own grace.
+func bootForServing(ctx context.Context, o options, layout paths, coreAddr string, node Node) (*coreSession, error) {
+	serveCtx := ctx
+	if deadline, ok := ctx.Deadline(); ok && time.Until(deadline) < 10*time.Second {
+		grace, cancel := context.WithTimeout(context.WithoutCancel(ctx), o.startTimeout)
+		defer cancel()
+		serveCtx = grace
+	}
+	return boot(serveCtx, o, layout, coreAddr, node)
 }
 
 // measure samples the target through the node, reusing the address that worked

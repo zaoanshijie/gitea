@@ -10,7 +10,7 @@
 | 国内站点（gitee 等）直接跳过 | 跳过规则可配置 |
 | 配置只在环境变量 | 不新增 app.ini 配置项 |
 
-## 2. 为什么改动只有三处
+## 2. 为什么改动只有四处
 
 Gitea 28.x 的 git 出站流量本来就经过一个**内置的本地正向代理**：
 
@@ -36,9 +36,16 @@ git 子进程  ──http.proxy──▶  127.0.0.1:<随机端口>（services/gi
 | `modules/proxy/launcher/launcher.go` | 新增，进程托管与探测 |
 | `modules/proxy/launcher/proc_{unix,windows}.go` | 新增，进程组与权限差异 |
 | `modules/egress/policies.go` | +10 行，插入一个分支 |
-| `routers/init.go` | +2 行，初始化 |
+| `services/gitproxy/server.go` | +18 行，拨号/CONNECT 超时改为可配置（默认仍是 30s） |
+| `routers/init.go` | +4 行，初始化与超时联调 |
 
 `git` 的任何调用点都没有改动。
+
+第四处（`services/gitproxy/server.go`）是为了配合**按需启动**：官方把「拨号到上游」限制
+在 30 秒（`proxyDialer.Timeout` 与 `handleConnect` 的 30s 上下文），而冷启动要拉订阅、
+排序、测速，实测 14~40 秒。不放开这两处，冷启动一旦超过 30 秒，第一个 git 请求就收到
+`CONNECT tunnel failed, response 504`，而代理几秒后就好了。现在 launcher 启动时把它调到
+`START_TIMEOUT + 15s`（所以还是只在配置了才生效），默认值不变。
 
 ## 3. 兼容性保证
 
@@ -212,6 +219,16 @@ HTTPS 远端拿不到路径是协议决定的：git 先发 `CONNECT github.com:4
 如果有这类目标并且实测选到慢节点，可以在 `app.ini` 里改用 `http://` 形式的 clone 地址，
 或直接把 `-check-url` 指到一个该 host 上确实返回实体的地址。
 
+注意 `-require-speed` 默认开启后，这类「探针读不到实体」的目标会**整体回退直连**
+（因为没有任何候选拿到测量值）。确实需要给这类 host 走代理时，用环境变量关掉这条规则：
+
+```ini
+GITEA_PROXY_AGENT_ARGS=-listen {addr} -idle {idle} -require-speed=false
+```
+
+关掉后恢复 proxy.4 的行为：仍然优先用有测量值的节点，只有在完全没有测量值时才使用
+「能连但测不到速」的节点。
+
 ### 7.4 实例隔离
 
 核心状态按**实例**隔离，不共用文件：
@@ -232,7 +249,10 @@ HTTPS 远端拿不到路径是协议决定的：git 先发 `CONNECT github.com:4
    已经被换掉了。
 
 配合 `removeStale`（启动时清理 2 小时前的实例文件）和「候选不共享核心」——
-同一时刻只允许一个核心占用核心端口，候选之间先 stop 再 boot。
+同一时刻只允许一个核心占用核心端口，所以选点分成两步：**扫描阶段每个候选都是
+「启动 → 测速 → 立刻停掉」，扫描结束再为胜出的节点启动一次**。早先的做法是把测得最快的
+核心留在端口上继续试下一个，结果后续候选全部 `bind: address already in use`
+（或被 `waitPortFree` 直接拒绝），实际只有第一个候选被测到。
 
 ### 7.5 预算控制
 
@@ -242,7 +262,9 @@ HTTPS 远端拿不到路径是协议决定的：git 先发 `CONNECT github.com:4
   单个候选的 core 启动、请求校验、带宽采样都受它约束
 - `START_TIMEOUT`（60s）是 launcher 的等待上限，必须大于前者；agent 若中途判定
   无可用节点会立即退出，launcher 看到进程退出就马上回退，不会傻等到 60s
-- 实测：默认阈值下 8~12s 就绪（试 1~2 个候选）；强制测满时约 28s
+- 实测：默认阈值下 8~14s 就绪（试 1~2 个候选）；强制测满 6~8 个候选约 40s。
+  后者超过了官方 gitproxy 的 30s 拨号上限，所以 launcher 会把该上限抬到
+  `START_TIMEOUT + 15s`（见 §2 第四处改动），否则第一个请求会先收到 504
 
 带宽采样在**首字节到达之后**才开始计时，否则一次 4s 的 TLS 握手会吃掉整个采样窗口，
 把「握手慢但传输快」的节点误判成 0。

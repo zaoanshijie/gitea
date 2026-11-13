@@ -89,7 +89,10 @@ func TestAgentEndToEnd(t *testing.T) {
 	nodeHost, nodePort := hostPortOf(t, echoServer(t))
 
 	cred := base64.StdEncoding.EncodeToString([]byte("aes-256-gcm:pw"))
-	subscription := fmt.Sprintf("ss://%s@%s:%d#local\n", cred, nodeHost, nodePort)
+	// Two entries for the same endpoint: the scan has to be able to evaluate a
+	// second candidate, which is only possible when the first core is gone.
+	subscription := fmt.Sprintf("ss://%s@%s:%d#local-a\nss://%s@%s:%d#local-b\n",
+		cred, nodeHost, nodePort, cred, nodeHost, nodePort)
 
 	sub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = fmt.Fprint(w, subscription)
@@ -196,7 +199,10 @@ func startAgentWithFakeNode(t *testing.T, extraArgs []string, env ...string) (*e
 
 	nodeHost, nodePort := hostPortOf(t, echoServer(t))
 	cred := base64.StdEncoding.EncodeToString([]byte("aes-256-gcm:pw"))
-	subscription := fmt.Sprintf("ss://%s@%s:%d#local\n", cred, nodeHost, nodePort)
+	// Two entries for the same endpoint: the scan must be able to evaluate a
+	// second candidate, which is only possible once the first core is gone.
+	subscription := fmt.Sprintf("ss://%s@%s:%d#local-a\nss://%s@%s:%d#local-b\n",
+		cred, nodeHost, nodePort, cred, nodeHost, nodePort)
 
 	sub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = fmt.Fprint(w, subscription)
@@ -255,6 +261,32 @@ func TestAgentRefusesANodeWithoutThroughput(t *testing.T) {
 	}
 	if !strings.Contains(output.String(), "no candidate moved any data") {
 		t.Errorf("expected an explicit refusal, got:\n%s", output.String())
+	}
+}
+
+// TestAgentScansCandidatesWithoutHoldingThePort covers the other half of the
+// "bind: address already in use" bug: a candidate that is only reachable must
+// not keep its core alive while the next candidate is probed.
+func TestAgentScansCandidatesWithoutHoldingThePort(t *testing.T) {
+	if testing.Short() {
+		t.Skip("builds two binaries")
+	}
+
+	_, output, listen := startAgentWithFakeNode(t, []string{
+		"-speed-url", "http://probe.invalid/blob",
+		"-speed-window", "1s",
+		"-speed-conns", "1",
+		"-check-url", "http://probe.invalid/check",
+		"-require-speed=false",
+		"-try-candidates", "2",
+	})
+
+	waitForPort(t, listen, 60*time.Second, output)
+	if got := strings.Count(output.String(), "reachable, throughput unknown"); got < 2 {
+		t.Errorf("both candidates must be probed, got %d://n%s", got, output.String())
+	}
+	if strings.Contains(output.String(), "still held by another process") {
+		t.Errorf("a candidate held the core port://n%s", output.String())
 	}
 }
 
