@@ -214,10 +214,16 @@ HTTPS 远端拿不到路径是协议决定的：git 先发 `CONNECT github.com:4
 | `https://github.com/` 根 | 143–310 KB/s | 162–271 KB/s |
 | `https://git.ffmpeg.org/ffmpeg.git`（http 形式测得） | 105–115 KB/s | 0（读不到数据） |
 
-已知短板：`git.ffmpeg.org` 这类站点的根路径只回 301/302、没有实体，HTTPS 远端下探针
-拿不到数据，速度记为未知，退化为按延迟排序（节点仍可用，只是没有带宽排序）。
-如果有这类目标并且实测选到慢节点，可以在 `app.ini` 里改用 `http://` 形式的 clone 地址，
-或直接把 `-check-url` 指到一个该 host 上确实返回实体的地址。
+已知短板：`git.ffmpeg.org` 这类站点的根路径只回 301/302。2026-11-13 实测（v28.3.0-proxy.6，
+114 上真实订阅）：301 的响应**带一个很小的实体**，探针能读到字节，速度记为 **1 KB/s**。
+所以 `-require-speed` 不会拒它，选点照常完成（`git ls-remote https://git.ffmpeg.org/ffmpeg.git`
+经代理 3.7s 通过）。只是这个数值是噪音，等于「哪个节点先回了实体就选谁」，没有带宽排序意义。
+
+只有**真的一字节不回**的目标（纯 204/HEAD，或所有节点对该目标都 5xx）才会因为
+`-require-speed` 整体回退直连。确实需要给这类 host 走代理时，见下面的开关说明。
+想让这类目标也有带宽排序，可以在 `app.ini` 里改用 `http://` 形式的 clone 地址
+（那样 launcher 能还原出完整的 `<repo>/info/refs`），或把 `-check-url` 指到一个该 host 上
+确实返回大实体的地址。
 
 注意 `-require-speed` 默认开启后，这类「探针读不到实体」的目标会**整体回退直连**
 （因为没有任何候选拿到测量值）。确实需要给这类 host 走代理时，用环境变量关掉这条规则：
