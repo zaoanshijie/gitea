@@ -118,6 +118,9 @@ git ls-remote --heads           24 refs  1.94s
 
 结论：**同地区内单节点差异大于地区差异**，且不同目标的最优节点不同，所以必须按目标实测。
 
+注意：HTTPS 远端下 target 只能是 host（见设计文档 7.3），所以真实日志里看到的是
+`throughput target https://github.com/` 而不是仓库地址，这是预期行为。
+
 冷启动耗时（`https://github.com/bkaradzic/bgfx.git` 为目标，发布版二进制）：
 
 | 场景 | 到 ready | 结果 |

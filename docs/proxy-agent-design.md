@@ -173,26 +173,29 @@ agent 侧解析顺序：显式 `-core`/`CORE` → `<BASE_DIR>/sing-box/sing-box`
 
 ### 7.3 测速针对的是「这次要访问的目标」
 
-`ProxyFor(host)` 触发启动时，launcher 会把本次请求的仓库地址通过
-`GITEA_PROXY_AGENT_TARGET` 传给 agent：
+launcher 把本次要访问的目标通过 `GITEA_PROXY_AGENT_TARGET` 传给 agent，agent 就测这个目标，
+而不是某个固定的公共地址。但**能拿到多精确的目标，取决于请求形态**：
 
-```
-https://github.com/bkaradzic/bgfx.git/info/refs?service=git-upload-pack
-        │                                     │
-        └── agent 从中还原出 ──────────────────┘
-            https://github.com/bkaradzic/bgfx.git/info/refs?service=git-upload-pack
-```
+| 远端方式 | Gitea 侧看到的请求 | 传给 agent 的 target |
+|---|---|---|
+| `https://`（绝大多数，走 CONNECT） | 只有 host，URL 在隧道里 | `github.com:443` → 探 `https://github.com/` |
+| `http://`（绝对 URI 形式） | 完整 URL，含路径 | 还原出的仓库地址 → 探 `<repo>/info/refs` |
 
-测的就正好是 git 真正发的那个请求。这一点很关键，因为**节点对目标的选择性极强**：
+HTTPS 远端拿不到路径是协议决定的：git 先发 `CONNECT github.com:443`，真正的
+`GET /owner/repo.git/info/refs` 在加密隧道里，中间的代理看不到。所以对 HTTPS 远端，
+实际探测的就是 host 根，失败再退 `http://host/`。
+
+这个精度对绝大多数站点够用，因为**节点对目标的选择性极强**：
 
 | 目标 | 美国节点 | 日本节点 |
 |---|---|---|
-| `https://github.com/` | 105–115 KB/s | 0（读不到数据） |
-| 目标整体（`github.com` 根） | 143–310 KB/s | 162–271 KB/s |
+| `https://github.com/` 根 | 143–310 KB/s | 162–271 KB/s |
+| `https://git.ffmpeg.org/ffmpeg.git`（http 形式测得） | 105–115 KB/s | 0（读不到数据） |
 
-`git.ffmpeg.org` 的根路径只回 301/302、没有实体，所以 agent 会依次尝试
-`info/refs` → 仓库根 → host 根 → `http://`，命中哪个就用哪个继续测其余候选；
-全都拿不到数据时不算节点失败（有些 git 服务会拒绝普通 HTTP 请求），只是速度记为 0。
+已知短板：`git.ffmpeg.org` 这类站点的根路径只回 301/302、没有实体，HTTPS 远端下探针
+拿不到数据，速度记为未知，退化为按延迟排序（节点仍可用，只是没有带宽排序）。
+如果有这类目标并且实测选到慢节点，可以在 `app.ini` 里改用 `http://` 形式的 clone 地址，
+或直接把 `-check-url` 指到一个该 host 上确实返回实体的地址。
 
 ### 7.4 预算控制
 
