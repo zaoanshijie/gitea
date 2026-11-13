@@ -76,7 +76,28 @@ git 子进程  ──http.proxy──▶  127.0.0.1:<随机端口>（services/gi
 | `PROBE_TTL` | `60s` | 同一 host 探测结果缓存时长 |
 | `IDLE` | `90s` | 传给 agent，空闲自退出时长 |
 | `SUBSCRIPTION` | 空 | 由 agent 读取，每次启动重新拉取 |
-| `CORE` | `sing-box` | 由 agent 读取，sing-box 路径 |
+| `BASE_DIR` | Gitea 可执行文件所在目录 | 由 launcher 推导后传给 agent，只在需要把状态放到别处时才显式设置 |
+| `CORE` | `<DATA>/sing-box` | 由 agent 读取；默认就是「Gitea 同级 `sing-box/` 目录里的那个」 |
+| `DATA` | `<BASE_DIR>/sing-box` | 由 agent 读取，核心配置、缓存、日志都落在这里 |
+
+### 4.1 路径推导
+
+目标：解压一个发布包就能跑，路径不配置也对。
+
+```
+Gitea 进程
+  └─ os.Executable() → /mnt/data/gitea/gitea
+       └─ BASE_DIR  = /mnt/data/gitea          （通过环境变量传给 agent）
+            ├─ DATA    = /mnt/data/gitea/sing-box
+            └─ CORE    = /mnt/data/gitea/sing-box/sing-box
+```
+
+agent 侧解析顺序：显式 `-core`/`CORE` → `<BASE_DIR>/sing-box/sing-box` → `PATH`。
+显式指定但文件不存在时**直接报错**，不会静默改用别的（否则打错字很难发现）。
+
+数据目录是唯一可以降级的东西：不可创建或不可写时换用临时目录并打警告，代理照常工作，
+只是缓存每次重建。核心找不到则 agent 退出，launcher 记录警告并回退直连——Gitea 本身
+不受影响，这也符合「代理出问题不能影响官方行为」这条底线。
 
 ## 5. 生命周期
 

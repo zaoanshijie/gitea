@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -30,6 +31,10 @@ import (
 // enough. Nothing runs while Gitea is idle.
 type Supervisor struct {
 	cfg Config
+
+	// baseDir is handed to the agent so it looks for the core binary next to
+	// the Gitea executable, which keeps a release archive self-contained.
+	baseDir string
 
 	// startMu serialises cold starts and probes so a burst of mirror jobs
 	// spawns exactly one process.
@@ -60,12 +65,12 @@ func Init(ctx context.Context) {
 		return
 	}
 
-	s := &Supervisor{cfg: *cfg, verified: make(map[string]time.Time)}
+	s := &Supervisor{cfg: *cfg, baseDir: baseDir(), verified: make(map[string]time.Time)}
 	global.Store(s)
 	context.AfterFunc(ctx, s.stop)
 
-	log.Info("Proxy agent enabled: command=%q listen=%s start-timeout=%s idle=%s",
-		cfg.Command, cfg.ListenAddr, cfg.StartTimeout, cfg.Idle)
+	log.Info("Proxy agent enabled: command=%q base-dir=%q listen=%s start-timeout=%s idle=%s",
+		cfg.Command, s.baseDir, cfg.ListenAddr, cfg.StartTimeout, cfg.Idle)
 	if len(cfg.SkipHosts) > 0 {
 		log.Info("Proxy agent skips: %s", strings.Join(cfg.SkipHosts, ", "))
 	}
@@ -155,6 +160,11 @@ func (s *Supervisor) startLocked() error {
 
 	cmd := exec.Command(s.cfg.Command, args...)
 	cmd.Env = os.Environ()
+	// The agent defaults to <base>/sing-box/sing-box; tell it where this Gitea
+	// lives unless the operator pinned the directory explicitly.
+	if s.baseDir != "" && os.Getenv(EnvBaseDir) == "" {
+		cmd.Env = append(cmd.Env, EnvBaseDir+"="+s.baseDir)
+	}
 	cmd.Stdout = &lineWriter{prefix: "proxy agent"}
 	cmd.Stderr = &lineWriter{prefix: "proxy agent"}
 	setProcAttr(cmd)
@@ -359,3 +369,23 @@ func (w *lineWriter) Write(p []byte) (int, error) {
 }
 
 var _ io.Writer = (*lineWriter)(nil)
+
+// EnvBaseDir tells the agent which directory the Gitea executable lives in, so
+// it can find <base>/sing-box/ without any per-instance configuration.
+const EnvBaseDir = EnvPrefix + "BASE_DIR"
+
+// baseDir is the directory of the running Gitea binary. Setting EnvBaseDir
+// explicitly wins, which keeps the core somewhere else when needed.
+func baseDir() string {
+	if v := strings.TrimSpace(os.Getenv(EnvBaseDir)); v != "" {
+		return filepath.Clean(v)
+	}
+	exe, err := os.Executable()
+	if err != nil {
+		return ""
+	}
+	if resolved, err := filepath.EvalSymlinks(exe); err == nil {
+		exe = resolved
+	}
+	return filepath.Dir(exe)
+}

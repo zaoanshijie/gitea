@@ -33,7 +33,7 @@ type decodedConfig struct {
 
 func buildForTest(t *testing.T, node Node) decodedConfig {
 	t.Helper()
-	raw, err := BuildSingBoxConfig(node, "127.0.0.1:17891")
+	raw, err := BuildSingBoxConfig(node, "127.0.0.1:17891", "/tmp/cache.db")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -127,7 +127,7 @@ func TestBuildTrojanGRPC(t *testing.T) {
 }
 
 func TestBuildRejectsBadListen(t *testing.T) {
-	if _, err := BuildSingBoxConfig(Node{Kind: "trojan"}, "not-an-address"); err == nil {
+	if _, err := BuildSingBoxConfig(Node{Kind: "trojan"}, "not-an-address", ""); err == nil {
 		t.Fatal("expected an error for a malformed listen address")
 	}
 }

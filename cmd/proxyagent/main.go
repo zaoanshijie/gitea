@@ -19,8 +19,8 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
-	"path/filepath"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 )
@@ -29,6 +29,7 @@ type options struct {
 	listen       string
 	subscription string
 	core         string
+	data         string
 	checkURL     string
 
 	idle          time.Duration
@@ -61,7 +62,8 @@ func parseFlags() options {
 	var o options
 	flag.StringVar(&o.listen, "listen", "127.0.0.1:17890", "loopback address to serve SOCKS on")
 	flag.StringVar(&o.subscription, "subscription", os.Getenv("GITEA_PROXY_AGENT_SUBSCRIPTION"), "subscription URL, fetched on every start")
-	flag.StringVar(&o.core, "core", envOr("GITEA_PROXY_AGENT_CORE", "sing-box"), "path of the sing-box binary")
+	flag.StringVar(&o.core, "core", strings.TrimSpace(os.Getenv(EnvCore)), "path of the sing-box binary (default: <base>/sing-box/sing-box)")
+	flag.StringVar(&o.data, "data", strings.TrimSpace(os.Getenv(EnvData)), "directory holding the core state (default: <base>/sing-box)")
 	flag.StringVar(&o.checkURL, "check-url", "https://github.com/robots.txt", "URL used to verify the chosen node, empty disables the check")
 	flag.DurationVar(&o.idle, "idle", 90*time.Second, "exit after this long without any connection (0 disables)")
 	flag.DurationVar(&o.maxDelay, "max-delay", 5*time.Second, "drop nodes slower than this handshake")
@@ -93,18 +95,24 @@ func run(ctx context.Context, o options) error {
 	}
 	coreAddr := fmt.Sprintf("127.0.0.1:%d", listenPort+1)
 
-	dir, err := os.MkdirTemp("", "gitea-proxy-agent-")
+	layout, err := resolvePaths(o.core, o.data, log.Printf)
 	if err != nil {
 		return err
 	}
-	defer os.RemoveAll(dir)
+	defer layout.cleanUp()
+	o.core = layout.core
+
+	if closer := redirectOutput(layout.logFile()); closer != nil {
+		defer closer()
+	}
+	log.Printf("base dir %s, data dir %s, core %s", layout.base, layout.dataDir, layout.core)
 
 	ranked, err := fetchAndRank(ctx, o)
 	if err != nil {
 		return err
 	}
 
-	sess, node, err := bootBest(ctx, o, dir, coreAddr, ranked)
+	sess, node, err := bootBest(ctx, o, layout, coreAddr, ranked)
 	if err != nil {
 		return err
 	}
@@ -119,12 +127,12 @@ func run(ctx context.Context, o options) error {
 	log.Printf("ready: listen=%s core=%s node=%s", o.listen, coreAddr, node)
 	fmt.Printf("ready listen=%s node=%s\n", o.listen, node)
 
-	return supervise(ctx, o, dir, coreAddr, rl, node, sess)
+	return supervise(ctx, o, layout, coreAddr, rl, node, sess)
 }
 
 // bootBest walks the ranked candidates until one starts and survives the
 // verification request.
-func bootBest(ctx context.Context, o options, dir, coreAddr string, ranked []Node) (*coreSession, Node, error) {
+func bootBest(ctx context.Context, o options, layout paths, coreAddr string, ranked []Node) (*coreSession, Node, error) {
 	limit := o.tryCandidates
 	if limit <= 0 || limit > len(ranked) {
 		limit = len(ranked)
@@ -133,7 +141,7 @@ func bootBest(ctx context.Context, o options, dir, coreAddr string, ranked []Nod
 	var lastErr error
 	for i := 0; i < limit; i++ {
 		node := ranked[i]
-		sess, err := boot(ctx, o, dir, coreAddr, node)
+		sess, err := boot(ctx, o, layout, coreAddr, node)
 		if err != nil {
 			lastErr = err
 			log.Printf("candidate %s rejected: %v", node, err)
@@ -148,8 +156,8 @@ func bootBest(ctx context.Context, o options, dir, coreAddr string, ranked []Nod
 	return nil, Node{}, lastErr
 }
 
-func boot(ctx context.Context, o options, dir, coreAddr string, node Node) (*coreSession, error) {
-	cfgPath, err := writeConfig(dir, node, coreAddr)
+func boot(ctx context.Context, o options, layout paths, coreAddr string, node Node) (*coreSession, error) {
+	cfgPath, err := writeConfig(layout, node, coreAddr)
 	if err != nil {
 		return nil, err
 	}
@@ -172,7 +180,7 @@ func boot(ctx context.Context, o options, dir, coreAddr string, node Node) (*cor
 
 // supervise keeps the core alive and exits once the proxy has been unused for
 // the configured idle period.
-func supervise(ctx context.Context, o options, dir, coreAddr string, rl *relay, node Node, sess *coreSession) error {
+func supervise(ctx context.Context, o options, layout paths, coreAddr string, rl *relay, node Node, sess *coreSession) error {
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
 
@@ -193,7 +201,7 @@ func supervise(ctx context.Context, o options, dir, coreAddr string, rl *relay, 
 			if err != nil {
 				return err
 			}
-			next, nextNode, err := bootBest(ctx, o, dir, coreAddr, ranked)
+			next, nextNode, err := bootBest(ctx, o, layout, coreAddr, ranked)
 			if err != nil {
 				return err
 			}
@@ -226,12 +234,12 @@ func fetchAndRank(ctx context.Context, o options) ([]Node, error) {
 	return ranked, nil
 }
 
-func writeConfig(dir string, node Node, coreAddr string) (string, error) {
-	raw, err := BuildSingBoxConfig(node, coreAddr)
+func writeConfig(layout paths, node Node, coreAddr string) (string, error) {
+	raw, err := BuildSingBoxConfig(node, coreAddr, layout.cacheFile())
 	if err != nil {
 		return "", err
 	}
-	path := filepath.Join(dir, "sing-box.json")
+	path := layout.configFile()
 	if err := os.WriteFile(path, raw, 0o600); err != nil {
 		return "", err
 	}
@@ -246,8 +254,8 @@ type coreSession struct {
 
 func startCore(bin, cfgPath, addr string, timeout time.Duration) (*coreSession, error) {
 	cmd := exec.Command(bin, "run", "-c", cfgPath)
-	cmd.Stdout = os.Stderr
-	cmd.Stderr = os.Stderr
+	cmd.Stdout = coreOutput
+	cmd.Stderr = coreOutput
 	if err := cmd.Start(); err != nil {
 		return nil, fmt.Errorf("start core %q: %w", bin, err)
 	}
@@ -286,11 +294,4 @@ func waitPort(addr string, timeout time.Duration) error {
 		time.Sleep(100 * time.Millisecond)
 	}
 	return fmt.Errorf("core did not listen on %s within %s", addr, timeout)
-}
-
-func envOr(key, def string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
-	}
-	return def
 }

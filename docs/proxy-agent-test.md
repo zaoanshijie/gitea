@@ -153,6 +153,30 @@ SHA256SUMS
 > 下载 arm64 时若出现 `sha256sum: FAILED`，先看文件大小是否与 Release 页面一致——
 > 大文件经代理传输可能被截断，断点续传重下即可，不是产物问题（已验证）。
 
+## 6.1 自包含目录与回退验证
+
+目标：不配任何路径，把 `gitea` 与 `sing-box/` 放同一目录即可工作。
+
+测试布局（故意让 agent 二进制与 gitea 分居两处，验证 `BASE_DIR` 确实由 Gitea 提供）：
+
+```
+/tmp/sc/gitea                        Gitea 二进制
+/tmp/sc/sing-box/sing-box            核心（唯一必需的手工放置）
+/tmp/agentbin/gitea-proxy-agent      agent 放在别处
+```
+
+| 检查 | 结果 |
+|---|---|
+| 启动日志 | `base-dir="/tmp/sc"`（取自 Gitea 自身，而非 agent 位置） |
+| agent 自述 | `base dir /tmp/sc, data dir /tmp/sc/sing-box, core /tmp/sc/sing-box/sing-box` |
+| 真实镜像（`octocat/Hello-World`） | `201`，6.5s，仓库 21MB、3 个分支，直连该 host 时常失败 |
+| data 目录产物 | `sing-box`、`cache.db`、`agent-sing-box.json`、`agent.log` 四个文件 |
+| `sing-box check -c agent-sing-box.json` | `config OK`（`experimental.cache_file` 写法有效） |
+| agent 自身目录 | 未被创建 `sing-box/` 子目录，说明未以自身位置推断 |
+| 空闲退出（`IDLE=60s`） | 61s 后 agent 退出，`pgrep sing-box` 为空，无孤儿进程 |
+| 移除核心后触发同步 | agent 打印 `fatal: no sing-box binary found: expected /tmp/sc/sing-box/sing-box`，退出码 1；launcher 记 `falling back to a direct connection`；Gitea 首页仍 200 |
+| 恢复核心后再同步 | `201`，1.5s，自动重新拉起 |
+
 ## 7. 未覆盖 / 已知限制
 
 | 项 | 说明 |
