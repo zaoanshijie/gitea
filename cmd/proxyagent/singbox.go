@@ -11,8 +11,10 @@ import (
 )
 
 // BuildSingBoxConfig renders a minimal sing-box configuration that exposes one
-// local SOCKS inbound and routes it through the chosen node.
-func BuildSingBoxConfig(node Node, listenAddr string) ([]byte, error) {
+// local SOCKS inbound and routes it through the chosen node. cachePath, when
+// set, keeps the core cache inside the data directory instead of the current
+// working directory.
+func BuildSingBoxConfig(node Node, listenAddr, cachePath string) ([]byte, error) {
 	host, port, err := net.SplitHostPort(listenAddr)
 	if err != nil {
 		return nil, err
@@ -42,6 +44,15 @@ func BuildSingBoxConfig(node Node, listenAddr string) ([]byte, error) {
 			},
 			"final": "proxy",
 		},
+	}
+
+	if cachePath != "" {
+		cfg["experimental"] = map[string]any{
+			"cache_file": map[string]any{
+				"enabled": true,
+				"path":    cachePath,
+			},
+		}
 	}
 
 	return json.MarshalIndent(cfg, "", "  ")

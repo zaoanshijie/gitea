@@ -34,7 +34,7 @@ func buildBinary(t *testing.T, out, pkg string) {
 	}
 }
 
-func waitForPort(t *testing.T, addr string, timeout time.Duration) {
+func waitForPort(t *testing.T, addr string, timeout time.Duration, output *bytes.Buffer) {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
@@ -43,6 +43,9 @@ func waitForPort(t *testing.T, addr string, timeout time.Duration) {
 			return
 		}
 		time.Sleep(50 * time.Millisecond)
+	}
+	if output != nil {
+		t.Fatalf("%s never started listening\n%s", addr, output.String())
 	}
 	t.Fatalf("%s never started listening", addr)
 }
@@ -93,7 +96,7 @@ func TestAgentEndToEnd(t *testing.T) {
 	}
 	defer func() { _ = cmd.Process.Kill() }()
 
-	waitForPort(t, listen, 40*time.Second)
+	waitForPort(t, listen, 40*time.Second, &output)
 
 	// A real request through the relay must reach the stand-in core.
 	if err := verifyThroughProxy(t.Context(), listen, "http://verify.invalid/check", 5*time.Second); err != nil {
