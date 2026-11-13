@@ -71,7 +71,7 @@ git 子进程  ──http.proxy──▶  127.0.0.1:<随机端口>（services/gi
 | `PORT` | `17890` | 本地监听端口，仅绑定 127.0.0.1 |
 | `SKIP_HOSTS` | `gitee.com,gitcode.com,atomgit.com,gitee.io` | 跳过关键字（子串匹配） |
 | `ALLOW_HOSTS` | 空 | 非空时**只**代理这些 host（精确或 `*.x`） |
-| `START_TIMEOUT` | `45s` | 冷启动上限（含拉订阅+测速+最多 4 个候选）；agent 自身预算 30s |
+| `START_TIMEOUT` | `60s` | 冷启动上限（含拉订阅+测速+最多 4 个候选）；agent 自身预算 40s |
 | `PROBE_TIMEOUT` | `5s` | 单次连通性探测上限 |
 | `PROBE_TTL` | `60s` | 同一 host 探测结果缓存时长 |
 | `IDLE` | `90s` | 传给 agent，空闲自退出时长 |
@@ -164,7 +164,14 @@ agent 侧解析顺序：显式 `-core`/`CORE` → `<BASE_DIR>/sing-box/sing-box`
 同地区能差一倍以上，按地区或按延迟筛都会踩到慢节点。所以排序只用来决定**先试谁**，
 真正的取舍靠实测带宽。
 
-### 7.2 测速针对的是「这次要访问的目标」
+### 7.2 测速即校验
+
+早先的实现用固定的 `https://github.com/robots.txt` 做「启动后校验」。这在
+`git.ffmpeg.org` 这类目标上会误判：节点能到 github 不代表能到目标，反之亦然。
+现在**向目标发的那次请求本身就是校验**——能拿到数据就算通过，同时得到带宽；
+拿不到才退回 `-check-url` 兜底，两者都失败才判定节点不可用。
+
+### 7.3 测速针对的是「这次要访问的目标」
 
 `ProxyFor(host)` 触发启动时，launcher 会把本次请求的仓库地址通过
 `GITEA_PROXY_AGENT_TARGET` 传给 agent：
@@ -187,18 +194,20 @@ https://github.com/bkaradzic/bgfx.git/info/refs?service=git-upload-pack
 `info/refs` → 仓库根 → host 根 → `http://`，命中哪个就用哪个继续测其余候选；
 全都拿不到数据时不算节点失败（有些 git 服务会拒绝普通 HTTP 请求），只是速度记为 0。
 
-### 7.3 预算控制
+### 7.4 预算控制
 
 选优会启动多个 core，必须防止冷启动无限拖长：
 
-- `-start-budget`（30s）覆盖「拉订阅 + 排序 + 选优」全过程，超时就用当前最优
-- `START_TIMEOUT`（45s）是 launcher 的等待上限，必须大于前者
-- 实测：默认阈值下 8.5s 就绪（试 2 个候选）；强制测满 6 个候选时 27.7s
+- `-start-budget`（40s）覆盖「拉订阅 + 排序 + 选优」全过程，超时就用当前最优；
+  单个候选的 core 启动、请求校验、带宽采样都受它约束
+- `START_TIMEOUT`（60s）是 launcher 的等待上限，必须大于前者；agent 若中途判定
+  无可用节点会立即退出，launcher 看到进程退出就马上回退，不会傻等到 60s
+- 实测：默认阈值下 8~12s 就绪（试 1~2 个候选）；强制测满时约 28s
 
 带宽采样在**首字节到达之后**才开始计时，否则一次 4s 的 TLS 握手会吃掉整个采样窗口，
 把「握手慢但传输快」的节点误判成 0。
 
-### 7.4 并发采样
+### 7.5 并发采样
 
 单条 TCP 连接经常被窗口限制卡住，测不出节点容量，所以默认开 4 条并发连接
 （`-speed-conns`）同时拉取，用 Range 头取不同区段，累加后再除以耗时。

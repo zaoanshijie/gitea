@@ -118,14 +118,31 @@ git ls-remote --heads           24 refs  1.94s
 
 结论：**同地区内单节点差异大于地区差异**，且不同目标的最优节点不同，所以必须按目标实测。
 
-冷启动耗时（`https://github.com/bkaradzic/bgfx.git` 为目标）：
+冷启动耗时（`https://github.com/bkaradzic/bgfx.git` 为目标，发布版二进制）：
 
-| 场景 | 到 ready | 候选数 |
+| 场景 | 到 ready | 结果 |
 |---|---|---|
-| 默认阈值 80 KB/s | 8.5s | 2 |
-| `-min-speed` 拉满（强制测满） | 27.7s | 6 |
+| 正常 | 6.0s | 265 KB/s，`ls-remote` 2235 refs |
+| 节点抖动 | 40.2s（吃满预算） | 42 KB/s，`ls-remote` 2235 refs |
+| 供应商限流 | 40s 后退出 | 见下 |
+| `-min-speed` 拉满（强制测满 6 个） | 27.7s | 267 KB/s |
 
-`-start-budget` 默认 30s，`START_TIMEOUT` 默认 45s，实测最坏情况仍在预算内。
+供应商限流时的日志形态（实测出现过，节点对 CONNECT 一律回 503）：
+
+```
+ERROR connection: open connection to github.com:443 using outbound/vless[proxy]:
+      unexpected HTTP response status: 503
+candidate ... (rank 1/47) rejected: Get "...": context deadline exceeded
+candidate ... (rank 2/47) rejected: Get "...": context deadline exceeded
+selection budget reached after 2 candidates
+fatal: Get "https://github.com/robots.txt": context deadline exceeded
+```
+
+此时 agent 以非零码退出，launcher 立刻看到进程结束并回退直连，**不会** 让 git 卡在
+一个假可用的代理上。这一条是「失败要快」的直接验证。
+
+`-start-budget` 默认 40s，`START_TIMEOUT` 默认 60s。节点抖动时可能吃满预算，
+但最终仍会选出一个能用的节点，不会回退成直连。
 
 一例真实故障（proxy.2 时期，用于说明问题存在）：同一仓库连续三次迁移都在约 14MB 处
 报 `curl 92 HTTP/2 stream ... CANCEL`，选中的都是握手最快、实测仅 25 KB/s 的节点；

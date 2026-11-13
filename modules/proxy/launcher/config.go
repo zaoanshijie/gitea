@@ -66,7 +66,7 @@ func Load() (*Config, bool, error) {
 	cfg := &Config{
 		Command:      strings.TrimSpace(os.Getenv(EnvPrefix + "COMMAND")),
 		ListenAddr:   fmt.Sprintf("127.0.0.1:%d", envInt(EnvPrefix+"PORT", 17890)),
-		StartTimeout: envDuration(EnvPrefix+"START_TIMEOUT", 45*time.Second),
+		StartTimeout: envDuration(EnvPrefix+"START_TIMEOUT", 60*time.Second),
 		ProbeTimeout: envDuration(EnvPrefix+"PROBE_TIMEOUT", 5*time.Second),
 		ProbeTTL:     envDuration(EnvPrefix+"PROBE_TTL", 60*time.Second),
 		Idle:         envDuration(EnvPrefix+"IDLE", 90*time.Second),
