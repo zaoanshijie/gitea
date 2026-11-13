@@ -42,8 +42,8 @@ sing-box 的位置是**写死**的：Gitea 可执行文件所在目录下的 `si
 /usr/local/bin/gitea-proxy-agent        # 新增，放哪都行
 /usr/local/bin/sing-box/                # 新增：数据目录（注意是个目录）
     sing-box                            #   核心二进制
-    cache.db                            #   核心缓存，自动生成
-    agent-sing-box.json                 #   选优后重写的核心配置
+    cache-<pid>-<n>.db                  #   每个核心实例独立的缓存，进程退出即删
+    agent-sing-box-<pid>-<n>.json       #   每个核心实例独立的配置，进程退出即删
     agent.log                           #   agent 运行日志，4MB 上限自动截断
 ```
 
@@ -61,7 +61,8 @@ sing-box 的位置是**写死**的：Gitea 可执行文件所在目录下的 `si
 | `GITEA_PROXY_AGENT_DATA` | 改数据目录；不设则 `<基准目录>/sing-box` |
 | `GITEA_PROXY_AGENT_CORE` | 改核心二进制路径；不设则 `<数据目录>/sing-box` |
 
-权限要求只有一条：**数据目录要对 Gitea 运行用户可写**，否则 `cache.db` 和日志写不进去。
+权限要求只有一条：**数据目录要对 Gitea 运行用户可写**，否则核心缓存和日志写不进去。
+配置与缓存按“实例”生成（文件名里带进程号和序号），核心退出时自动删除；`agent.log` 是唯一长期驻留的文件，超过 4MB 自动截断。
 
 ```bash
 sudo mkdir -p /usr/local/bin/sing-box
@@ -141,9 +142,10 @@ journalctl -u gitea -n 200 | grep -i "proxy agent"
 # c. 空闲时没有进程
 pgrep -a sing-box || echo "空闲，符合预期"
 
-# d. 触发一次 mirror 同步后，数据目录出现四个文件
+# d. 触发一次 mirror 同步后，数据目录在同步期间出现实例文件
 ls -l /usr/local/bin/sing-box
-#   sing-box  cache.db  agent-sing-box.json  agent.log
+#   sing-box  cache-<pid>-<n>.db  agent-sing-box-<pid>-<n>.json  agent.log
+#   同步结束后实例文件会被删除，只剩 sing-box 与 agent.log
 
 # e. 同步结束约 90s 后进程消失
 sleep 100; pgrep -a sing-box || echo "已自动回收"

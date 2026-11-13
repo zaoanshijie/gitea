@@ -14,6 +14,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 )
@@ -180,4 +181,103 @@ func TestAgentExitsWhenNoNodeWorks(t *testing.T) {
 		_ = cmd.Process.Kill()
 		t.Fatal("the agent hung instead of failing")
 	}
+}
+
+// startAgentWithFakeNode wires the stand-in node, subscription and core
+// together and returns the running agent plus its output.
+func startAgentWithFakeNode(t *testing.T, extraArgs []string, env ...string) (*exec.Cmd, *bytes.Buffer, string) {
+	t.Helper()
+
+	dir := tempDir(t)
+	fakecore := filepath.Join(dir, exeName("fakecore"))
+	agent := filepath.Join(dir, exeName("agent"))
+	buildBinary(t, fakecore, "./testdata/fakecore")
+	buildBinary(t, agent, ".")
+
+	nodeHost, nodePort := hostPortOf(t, echoServer(t))
+	cred := base64.StdEncoding.EncodeToString([]byte("aes-256-gcm:pw"))
+	subscription := fmt.Sprintf("ss://%s@%s:%d#local\n", cred, nodeHost, nodePort)
+
+	sub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = fmt.Fprint(w, subscription)
+	}))
+	t.Cleanup(sub.Close)
+
+	listen := freeAddr(t)
+	args := append([]string{
+		"-listen", listen,
+		"-subscription", sub.URL,
+		"-core", fakecore,
+		"-idle", "3s",
+		"-probe-timeout", "1s",
+		"-pick-timeout", "10s",
+		"-start-timeout", "10s",
+		"-start-budget", "30s",
+		"-verify-timeout", "3s",
+	}, extraArgs...)
+
+	cmd := exec.Command(agent, args...)
+	cmd.Env = append(os.Environ(), env...)
+	var output bytes.Buffer
+	cmd.Stdout = &output
+	cmd.Stderr = &output
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = cmd.Process.Kill() })
+	return cmd, &output, listen
+}
+
+// TestAgentRefusesANodeWithoutThroughput pins the 0 KB/s selection: a node
+// that answers the healthcheck but carries no bytes must be refused, because
+// binding it only moves the failure into the mirror job.
+func TestAgentRefusesANodeWithoutThroughput(t *testing.T) {
+	if testing.Short() {
+		t.Skip("builds two binaries")
+	}
+
+	cmd, output, _ := startAgentWithFakeNode(t, []string{
+		"-speed-url", "http://probe.invalid/blob",
+		"-speed-window", "1s",
+		"-speed-conns", "1",
+		"-check-url", "http://probe.invalid/check",
+	})
+
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatalf("the agent must not serve a node without throughput\n%s", output.String())
+		}
+	case <-time.After(60 * time.Second):
+		t.Fatalf("the agent hung instead of refusing the node\n%s", output.String())
+	}
+	if !strings.Contains(output.String(), "no candidate moved any data") {
+		t.Errorf("expected an explicit refusal, got:\n%s", output.String())
+	}
+}
+
+// TestAgentServesANodeThatMovesData is the happy path of the same code: with a
+// body to read, the measurement succeeds and the proxy comes up.
+func TestAgentServesANodeThatMovesData(t *testing.T) {
+	if testing.Short() {
+		t.Skip("builds two binaries")
+	}
+
+	cmd, output, listen := startAgentWithFakeNode(t, []string{
+		"-speed-url", "http://probe.invalid/blob",
+		"-speed-window", "1s",
+		"-speed-conns", "2",
+		"-check-url", "http://probe.invalid/check",
+	}, "FAKECORE_BODY=2097152")
+
+	waitForPort(t, listen, 45*time.Second, output)
+	if err := verifyThroughProxy(t.Context(), listen, "http://probe.invalid/check", 5*time.Second); err != nil {
+		t.Fatalf("request through the agent failed: %v\n%s", err, output.String())
+	}
+	if !strings.Contains(output.String(), "throughput ") {
+		t.Errorf("expected a throughput measurement, got:\n%s", output.String())
+	}
+	_ = cmd.Process.Kill()
 }

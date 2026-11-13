@@ -22,6 +22,7 @@ import (
 	"os/signal"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
@@ -37,6 +38,7 @@ type options struct {
 	speedWindow  time.Duration
 	speedConns   int
 	minSpeed     int64
+	requireSpeed bool
 
 	idle          time.Duration
 	maxDelay      time.Duration
@@ -85,6 +87,7 @@ func parseFlags() options {
 	flag.DurationVar(&o.speedWindow, "speed-window", 2*time.Second, "how long to sample throughput per candidate")
 	flag.IntVar(&o.speedConns, "speed-conns", 4, "parallel connections used by the throughput probe")
 	flag.Int64Var(&o.minSpeed, "min-speed", 80*1024, "accept the first candidate at least this fast (bytes/s), 0 disables the check")
+	flag.BoolVar(&o.requireSpeed, "require-speed", true, "refuse to serve a node that moved no data towards the target: direct is better than a dead tunnel")
 	flag.IntVar(&o.concurrency, "concurrency", 32, "concurrent probes")
 	flag.IntVar(&o.tryCandidates, "try-candidates", 4, "how many ranked nodes to try before giving up")
 	flag.Parse()
@@ -113,6 +116,9 @@ func run(ctx context.Context, o options) error {
 		return err
 	}
 	defer layout.cleanUp()
+	// Cores that were killed by an earlier run leave their per-instance files
+	// behind; they are never reused, so drop the old ones.
+	layout.removeStale(2 * time.Hour)
 	o.core = layout.core
 
 	if closer := redirectOutput(layout.logFile()); closer != nil {
@@ -240,12 +246,24 @@ func bootBest(ctx context.Context, o options, layout paths, coreAddr string, ran
 	var (
 		best     *coreSession
 		bestNode Node
-		bestBps  int64 = -1
+		bestBps  int64 = -1 // -1: no measurement yet
+		haveBps  bool
+		tried    int
 		lastErr  error
+
+		// A node that is reachable but could not be measured is remembered by
+		// value only. Keeping its core alive would hold the core port and make
+		// every later candidate fail to bind.
+		parkedNode *Node
 
 		probeURLs = o.probeURLs()
 		pinnedURL string
 	)
+
+	// A node that answers the healthcheck but moves no bytes is not usable for
+	// a clone, and picking it is what produced the 502/504 storm: the mirror
+	// job then fails anyway, just later and more expensively.
+	requireSpeed := o.requireSpeed && len(probeURLs) > 0 && o.speedWindow > 0
 
 	for i := 0; i < limit; i++ {
 		if ctx.Err() != nil {
@@ -253,6 +271,7 @@ func bootBest(ctx context.Context, o options, layout paths, coreAddr string, ran
 			break
 		}
 		node := ranked[i]
+		tried++
 		sess, err := boot(ctx, o, layout, coreAddr, node)
 		if err != nil {
 			lastErr = err
@@ -261,13 +280,12 @@ func bootBest(ctx context.Context, o options, layout paths, coreAddr string, ran
 		}
 
 		bps := int64(0)
-		verified := false
-		err = nil
+		measured := false
 		if len(probeURLs) > 0 && o.speedWindow > 0 {
 			bps, err = measure(ctx, o, coreAddr, probeURLs, &pinnedURL)
-			verified = err == nil
+			measured = err == nil
 		}
-		if !verified {
+		if !measured {
 			// Either speed measurement is off, or the target refused a plain
 			// request. Try the cheap healthcheck so a working node is not
 			// discarded, and accept the node when nothing can be checked.
@@ -285,21 +303,28 @@ func bootBest(ctx context.Context, o options, layout paths, coreAddr string, ran
 				continue
 			}
 			if len(probeURLs) > 0 && o.speedWindow > 0 {
-				log.Printf("candidate %s (rank %d/%d): verified, speed unknown", node, i+1, len(ranked))
+				log.Printf("candidate %s (rank %d/%d): reachable, throughput unknown", node, i+1, len(ranked))
 			}
 			bps = 0
 		}
 
-		if bps > bestBps {
+		// A measured candidate always wins and the fastest measurement wins.
+		// Everything else gives its core back: only one core may exist at a
+		// time, because they all bind the same port.
+		if measured && (!haveBps || bps > bestBps) {
 			if best != nil {
 				best.stop()
 			}
-			best, bestNode, bestBps = sess, node, bps
+			best, bestNode, bestBps, haveBps = sess, node, bps, true
 		} else {
+			if !measured && parkedNode == nil {
+				parked := node
+				parkedNode = &parked
+			}
 			sess.stop()
 		}
 
-		if o.minSpeed > 0 && bestBps >= o.minSpeed {
+		if o.minSpeed > 0 && haveBps && bestBps >= o.minSpeed {
 			break
 		}
 		if ctx.Err() != nil {
@@ -309,12 +334,29 @@ func bootBest(ctx context.Context, o options, layout paths, coreAddr string, ran
 	}
 
 	if best == nil {
+		if requireSpeed && tried > 0 {
+			msg := fmt.Sprintf("no candidate moved any data from %s after %d candidate(s)", probeURLs[0], tried)
+			if lastErr != nil {
+				return nil, Node{}, fmt.Errorf("%s: %w", msg, lastErr)
+			}
+			return nil, Node{}, errors.New(msg)
+		}
+		if parkedNode != nil {
+			// Measurement was not conclusive but the node did answer; start it
+			// once more now that the port is free.
+			sess, err := boot(ctx, o, layout, coreAddr, *parkedNode)
+			if err != nil {
+				return nil, Node{}, err
+			}
+			log.Printf("using reachable node %s without a throughput measurement", *parkedNode)
+			return sess, *parkedNode, nil
+		}
 		if lastErr == nil {
 			lastErr = errors.New("no candidate could be started")
 		}
 		return nil, Node{}, lastErr
 	}
-	if o.minSpeed > 0 && bestBps >= 0 && bestBps < o.minSpeed {
+	if o.minSpeed > 0 && haveBps && bestBps >= 0 && bestBps < o.minSpeed {
 		log.Printf("no candidate reached %d KB/s, using the fastest anyway: %s at %d KB/s",
 			o.minSpeed/1024, bestNode, bestBps/1024)
 	}
@@ -349,7 +391,7 @@ func measure(ctx context.Context, o options, coreAddr string, probeURLs []string
 // wait are bounded by the caller's budget so a stuck core cannot eat the whole
 // selection window.
 func boot(ctx context.Context, o options, layout paths, coreAddr string, node Node) (*coreSession, error) {
-	cfgPath, err := writeConfig(layout, node, coreAddr)
+	cfgPath, cachePath, err := writeConfig(layout, node, coreAddr, nextCoreTag())
 	if err != nil {
 		return nil, err
 	}
@@ -360,9 +402,10 @@ func boot(ctx context.Context, o options, layout paths, coreAddr string, node No
 		}
 	}
 	if timeout <= 0 {
+		removeInstanceFiles(cfgPath, cachePath)
 		return nil, errors.New("no budget left to start a core")
 	}
-	return startCore(ctx, o.core, cfgPath, coreAddr, timeout)
+	return startCore(ctx, o.core, cfgPath, cachePath, coreAddr, timeout)
 }
 
 // supervise keeps the core alive and exits once the proxy has been unused for
@@ -424,33 +467,52 @@ func fetchAndRank(ctx context.Context, o options) ([]Node, error) {
 	return ranked, nil
 }
 
-func writeConfig(layout paths, node Node, coreAddr string) (string, error) {
-	raw, err := BuildSingBoxConfig(node, coreAddr, layout.cacheFile())
+func writeConfig(layout paths, node Node, coreAddr, tag string) (cfgPath, cachePath string, err error) {
+	cachePath = layout.instanceCacheFile(tag)
+	raw, err := BuildSingBoxConfig(node, coreAddr, cachePath)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
-	path := layout.configFile()
-	if err := os.WriteFile(path, raw, 0o600); err != nil {
-		return "", err
+	cfgPath = layout.instanceConfigFile(tag)
+	if err := os.WriteFile(cfgPath, raw, 0o600); err != nil {
+		return "", "", err
 	}
-	return path, nil
+	return cfgPath, cachePath, nil
 }
 
 type coreSession struct {
-	cmd  *exec.Cmd
-	done chan struct{}
-	err  error
+	cmd       *exec.Cmd
+	done      chan struct{}
+	err       error
+	cfgPath   string
+	cachePath string
 }
 
-func startCore(ctx context.Context, bin, cfgPath, addr string, timeout time.Duration) (*coreSession, error) {
+// coreSeq numbers the core instances of this process so each one gets its own
+// config and cache file.
+var coreSeq atomic.Int64
+
+func nextCoreTag() string {
+	return fmt.Sprintf("%d-%d", os.Getpid(), coreSeq.Add(1))
+}
+
+func startCore(ctx context.Context, bin, cfgPath, cachePath, addr string, timeout time.Duration) (*coreSession, error) {
+	// A predecessor may still be releasing the port. Waiting here turns a core
+	// that would die with "address already in use" into a clean start.
+	if err := waitPortFree(ctx, addr, 2*time.Second); err != nil {
+		removeInstanceFiles(cfgPath, cachePath)
+		return nil, err
+	}
+
 	cmd := exec.Command(bin, "run", "-c", cfgPath)
 	cmd.Stdout = coreOutput
 	cmd.Stderr = coreOutput
 	if err := cmd.Start(); err != nil {
+		removeInstanceFiles(cfgPath, cachePath)
 		return nil, fmt.Errorf("start core %q: %w", bin, err)
 	}
 
-	sess := &coreSession{cmd: cmd, done: make(chan struct{})}
+	sess := &coreSession{cmd: cmd, done: make(chan struct{}), cfgPath: cfgPath, cachePath: cachePath}
 	go func() {
 		sess.err = cmd.Wait()
 		close(sess.done)
@@ -464,13 +526,39 @@ func startCore(ctx context.Context, bin, cfgPath, addr string, timeout time.Dura
 }
 
 func (s *coreSession) stop() {
-	if s.cmd == nil || s.cmd.Process == nil {
-		return
+	if s.cmd != nil && s.cmd.Process != nil {
+		_ = s.cmd.Process.Kill()
+		select {
+		case <-s.done:
+		case <-time.After(3 * time.Second):
+		}
 	}
-	_ = s.cmd.Process.Kill()
-	select {
-	case <-s.done:
-	case <-time.After(3 * time.Second):
+	removeInstanceFiles(s.cfgPath, s.cachePath)
+	s.cmd, s.cfgPath, s.cachePath = nil, "", ""
+}
+
+func removeInstanceFiles(paths ...string) {
+	for _, p := range paths {
+		if p != "" {
+			_ = os.Remove(p)
+		}
+	}
+}
+
+// waitPortFree blocks until nothing listens on addr, so a core that is still
+// being torn down cannot make the next one fail at bind time.
+func waitPortFree(ctx context.Context, addr string, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for {
+		conn, err := net.DialTimeout("tcp", addr, 200*time.Millisecond)
+		if err != nil {
+			return nil
+		}
+		_ = conn.Close()
+		if time.Now().After(deadline) || ctx.Err() != nil {
+			return fmt.Errorf("%s is still held by another process", addr)
+		}
+		time.Sleep(50 * time.Millisecond)
 	}
 }
 
