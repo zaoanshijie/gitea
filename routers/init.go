@@ -148,7 +148,10 @@ func InitWebInstalled(ctx context.Context) {
 	mustInit(packages_spec.InitManager)
 
 	// Booting long running goroutines.
-	launcher.Init(ctx)                     // reads GITEA_PROXY_AGENT_* only, a no-op when unset
+	launcher.Init(ctx)                      // reads GITEA_PROXY_AGENT_* only, a no-op when unset
+	if t := launcher.DialTimeout(); t > 0 { // a cold start may take longer than one TCP connect
+		gitproxy_service.SetDialTimeout(t)
+	}
 	mustInitCtx(ctx, gitproxy_service.Run) // must start before mirror/migration services spawn git
 	mustInit(indexer_service.Init)
 

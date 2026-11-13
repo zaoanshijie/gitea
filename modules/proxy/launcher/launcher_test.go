@@ -125,6 +125,23 @@ func githubRequest() *http.Request {
 	return &http.Request{URL: &url.URL{Scheme: "https", Host: "github.com"}}
 }
 
+// TestDialTimeoutCoversTheColdStart pins the fix for "CONNECT tunnel failed,
+// response 504" on the first request after a cold start: the git proxy's own
+// dial timeout has to be longer than a full node selection.
+func TestDialTimeoutCoversTheColdStart(t *testing.T) {
+	Shutdown()
+	if got := DialTimeout(); got != 0 {
+		t.Errorf("a disabled launcher must keep the official timeout, got %s", got)
+	}
+
+	global.Store(&Supervisor{cfg: Config{StartTimeout: 60 * time.Second}})
+	defer Shutdown()
+
+	if got := DialTimeout(); got <= 60*time.Second {
+		t.Errorf("dial timeout %s must exceed the start timeout", got)
+	}
+}
+
 func TestProxyForWithoutSupervisor(t *testing.T) {
 	Shutdown()
 

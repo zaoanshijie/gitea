@@ -39,8 +39,31 @@ const (
 	directHeader = "X-Gitea-Direct"  // asks for a CONNECT tunnel that skips the operator's proxy, as git:// remotes never used one
 )
 
+// officialProxyDialTimeout is how long one dial towards the operator's proxy
+// may take in the official build.
+const officialProxyDialTimeout = 30 * time.Second
+
 // proxyDialer reaches the operator's proxies, which are configuration rather than user input
-var proxyDialer = &net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}
+var proxyDialer = &net.Dialer{Timeout: officialProxyDialTimeout, KeepAlive: 30 * time.Second}
+
+// connectTimeout bounds one CONNECT setup: selecting the proxy, reaching it and
+// getting the tunnel established.
+var connectTimeout = officialProxyDialTimeout
+
+// SetDialTimeout raises how long setting up an upstream tunnel may take.
+//
+// A dial can now also wait for an on-demand egress proxy to start, and that
+// start is far slower than a TCP connect: it fetches a subscription, ranks the
+// nodes and measures a few of them. Without this the first git request after a
+// cold start gives up at 30s and answers 504 while the proxy is still booting.
+// The launcher calls this at startup; a non-positive value keeps the default.
+func SetDialTimeout(d time.Duration) {
+	if d <= 0 {
+		return
+	}
+	proxyDialer.Timeout = d
+	connectTimeout = d
+}
 
 // copyBuffers beats the reverse proxy's 32 KiB default as it flushes every write, the transport's ReadBufferSize lets a read span chunks
 type copyBuffers struct{}
@@ -199,7 +222,7 @@ func (s *server) handleConnect(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "egress: invalid CONNECT target", http.StatusBadRequest)
 		return
 	}
-	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(r.Context(), connectTimeout)
 	defer cancel()
 	dial := s.dialUpstream
 	if r.Header.Get(directHeader) != "" {

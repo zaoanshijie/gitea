@@ -239,6 +239,9 @@ SHA256SUMS
 | `TestRemoveStaleInstanceFiles` | 2 小时前的实例文件被清理，新文件与 `agent.log` 保留 |
 | `TestAgentRefusesANodeWithoutThroughput` | 节点能过健康检查但搬不动数据时，agent 拒绝服务并退出非 0 |
 | `TestAgentServesANodeThatMovesData` | 同一路径的正例：读到实体后正常就绪 |
+| `TestAgentScansCandidatesWithoutHoldingThePort` | 两个候选都能被探到，且不出现 `bind: address already in use` |
+| `TestDialTimeoutCoversTheColdStart` | 启用时拨号超时必须大于 start-timeout；未启用时为 0（官方行为） |
+| `TestSetDialTimeout` | gitproxy 的拨号与 CONNECT 超时可被抬高，非正值被忽略 |
 
 ### 真机（192.168.15.114，linux/amd64，真实订阅 + 真实 sing-box 1.14.4）
 
@@ -255,6 +258,17 @@ SHA256SUMS
 | 运行期实例文件 | `agent-sing-box-36144-1.json`、`cache-36144-1.db` |
 | 空闲退出后 | 实例文件被删除，只剩 `sing-box` 与 `agent.log`，退出码 0 |
 | **双实例并发**（同一数据目录，端口 17990/17995） | 两个核心各自持有 `cache-<pid>-<n>.db`，**没有** `initialize cache-file` 失败；两路请求均 `code=200` |
+
+### 真机（192.168.15.114，完整 Gitea 实例 + sqlite）
+
+用源码构建的 amd64 二进制（非 bindata，templates/public/options 放在工作目录）跑完整迁移流程：
+
+| 场景 | 结果 |
+|---|---|
+| 冷启动 + 迁移 `octocat/Hello-World` | 冷启动 14s；`201`；仓库 `empty=false size=21978` |
+| 强制慢冷启动（`-try-candidates 8 -min-speed 999999999`） | 冷启动 **40s**，日志 `selection budget reached after 6 candidates` 后仍正常就绪 |
+| 同一场景下的迁移 | `POST /api/v1/repos/migrate ... 201 Created in 201655.7ms`（节点慢，但**没有 504**） |
+| 改前表现 | 冷启动 >30s 时第一个请求必然 `CONNECT tunnel failed, response 504` |
 
 ### 已知限制补充
 
