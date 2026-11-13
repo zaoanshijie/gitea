@@ -25,6 +25,26 @@ func exeName(name string) string {
 	return name
 }
 
+// tempDir is t.TempDir with a tolerant removal: a process that has just been
+// killed can keep its executable mapped for a short while on Windows, which
+// would otherwise fail the cleanup of an unrelated assertion.
+func tempDir(t *testing.T) string {
+	t.Helper()
+	dir, err := os.MkdirTemp("", "proxyagent-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		for i := 0; i < 20; i++ {
+			if err := os.RemoveAll(dir); err == nil {
+				return
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+	})
+	return dir
+}
+
 func buildBinary(t *testing.T, out, pkg string) {
 	t.Helper()
 	cmd := exec.Command("go", "build", "-o", out, pkg)
@@ -58,7 +78,7 @@ func TestAgentEndToEnd(t *testing.T) {
 		t.Skip("builds two binaries")
 	}
 
-	dir := t.TempDir()
+	dir := tempDir(t)
 	fakecore := filepath.Join(dir, exeName("fakecore"))
 	agent := filepath.Join(dir, exeName("agent"))
 	buildBinary(t, fakecore, "./testdata/fakecore")
@@ -112,6 +132,9 @@ func TestAgentEndToEnd(t *testing.T) {
 		if err != nil {
 			t.Fatalf("agent exited with %v\n%s", err, output.String())
 		}
+		// Give the OS a moment to release the stand-in core before the temp
+		// directory is removed; on Windows an exit handle can lag slightly.
+		time.Sleep(500 * time.Millisecond)
 	case <-time.After(25 * time.Second):
 		t.Fatalf("agent did not exit when idle\n%s", output.String())
 	}
@@ -122,7 +145,7 @@ func TestAgentExitsWhenNoNodeWorks(t *testing.T) {
 		t.Skip("builds a binary")
 	}
 
-	dir := t.TempDir()
+	dir := tempDir(t)
 	agent := filepath.Join(dir, exeName("agent"))
 	buildBinary(t, agent, ".")
 

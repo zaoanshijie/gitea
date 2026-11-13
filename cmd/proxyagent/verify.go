@@ -105,10 +105,13 @@ func probeSpeed(ctx context.Context, socksAddr, target string, window time.Durat
 	}
 
 	elapsed := time.Since(start)
-	if elapsed <= 0 {
-		return 0, nil
+	if elapsed < time.Millisecond {
+		// Windows timers are coarse; never divide by a rounded-down zero.
+		elapsed = time.Millisecond
 	}
-	if ok == 0 {
+	if ok == 0 || total == 0 {
+		// A cancelled request can end with a nil error and zero bytes, which
+		// must not be reported as a usable measurement.
 		return 0, fmt.Errorf("no connection could read from %s", target)
 	}
 	return int64(float64(total) / elapsed.Seconds()), nil

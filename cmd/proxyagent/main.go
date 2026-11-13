@@ -71,18 +71,18 @@ func parseFlags() options {
 	flag.StringVar(&o.subscription, "subscription", os.Getenv("GITEA_PROXY_AGENT_SUBSCRIPTION"), "subscription URL, fetched on every start")
 	flag.StringVar(&o.core, "core", strings.TrimSpace(os.Getenv(EnvCore)), "path of the sing-box binary (default: <base>/sing-box/sing-box)")
 	flag.StringVar(&o.data, "data", strings.TrimSpace(os.Getenv(EnvData)), "directory holding the core state (default: <base>/sing-box)")
-	flag.StringVar(&o.checkURL, "check-url", "https://github.com/robots.txt", "URL used to verify the chosen node, empty disables the check")
+	flag.StringVar(&o.checkURL, "check-url", "https://github.com/robots.txt", "fallback URL used to verify a node when the target itself cannot be probed, empty disables it")
 	flag.DurationVar(&o.idle, "idle", 90*time.Second, "exit after this long without any connection (0 disables)")
 	flag.DurationVar(&o.maxDelay, "max-delay", 5*time.Second, "drop nodes slower than this handshake")
 	flag.DurationVar(&o.probeTimeout, "probe-timeout", 3*time.Second, "per node handshake timeout")
 	flag.DurationVar(&o.subTimeout, "subscription-timeout", 20*time.Second, "subscription fetch timeout")
 	flag.DurationVar(&o.startTimeout, "start-timeout", 15*time.Second, "how long sing-box may take to bind")
-	flag.DurationVar(&o.startBudget, "start-budget", 30*time.Second, "hard cap for fetch + rank + node selection, so the caller stops waiting in bounded time")
+	flag.DurationVar(&o.startBudget, "start-budget", 40*time.Second, "hard cap for fetch + rank + node selection, so the caller stops waiting in bounded time")
 	flag.DurationVar(&o.pickTimeout, "pick-timeout", 20*time.Second, "budget for the subscription fetch and the latency ranking")
-	flag.DurationVar(&o.verifyTimeout, "verify-timeout", 12*time.Second, "how long the verification request may take")
+	flag.DurationVar(&o.verifyTimeout, "verify-timeout", 8*time.Second, "how long the verification request may take")
 	flag.StringVar(&o.target, "target", envTarget(), "host the proxy is started for; throughput is measured against it")
 	flag.StringVar(&o.speedURL, "speed-url", "", "explicit URL used to measure throughput, overrides -target")
-	flag.DurationVar(&o.speedWindow, "speed-window", 3*time.Second, "how long to sample throughput per candidate")
+	flag.DurationVar(&o.speedWindow, "speed-window", 2*time.Second, "how long to sample throughput per candidate")
 	flag.IntVar(&o.speedConns, "speed-conns", 4, "parallel connections used by the throughput probe")
 	flag.Int64Var(&o.minSpeed, "min-speed", 80*1024, "accept the first candidate at least this fast (bytes/s), 0 disables the check")
 	flag.IntVar(&o.concurrency, "concurrency", 32, "concurrent probes")
@@ -221,12 +221,16 @@ func dedupeStrings(in []string) []string {
 
 func envTarget() string { return strings.TrimSpace(os.Getenv(EnvTarget)) }
 
-// bootBest walks the ranked candidates and keeps the fastest one that starts,
-// answers a real request and moves bytes at an acceptable rate.
+// bootBest walks the ranked candidates and keeps the fastest one that starts
+// and answers a real request towards the target.
 //
 // Ranking alone is not enough: the endpoint with the lowest handshake latency
 // is usually the most oversubscribed, which is exactly the wrong choice for a
 // mirror clone of a few hundred megabytes.
+//
+// The throughput probe doubles as the healthcheck. Verifying against a fixed
+// URL would be wrong: a node may reach one host and not another, and the whole
+// point of the target-aware selection is that the two differ.
 func bootBest(ctx context.Context, o options, layout paths, coreAddr string, ranked []Node) (*coreSession, Node, error) {
 	limit := o.tryCandidates
 	if limit <= 0 || limit > len(ranked) {
@@ -257,25 +261,33 @@ func bootBest(ctx context.Context, o options, layout paths, coreAddr string, ran
 		}
 
 		bps := int64(0)
-		if o.speedWindow > 0 && len(probeURLs) > 0 {
-			try := probeURLs
-			if pinnedURL != "" {
-				try = []string{pinnedURL}
+		verified := false
+		err = nil
+		if len(probeURLs) > 0 && o.speedWindow > 0 {
+			bps, err = measure(ctx, o, coreAddr, probeURLs, &pinnedURL)
+			verified = err == nil
+		}
+		if !verified {
+			// Either speed measurement is off, or the target refused a plain
+			// request. Try the cheap healthcheck so a working node is not
+			// discarded, and accept the node when nothing can be checked.
+			if o.checkURL != "" && ctx.Err() == nil {
+				verifyCtx, cancel := context.WithTimeout(ctx, o.verifyTimeout)
+				err = verifyThroughProxy(verifyCtx, coreAddr, o.checkURL, o.verifyTimeout)
+				cancel()
+			} else if o.checkURL == "" {
+				err = nil
 			}
-			probeCtx, cancel := context.WithTimeout(ctx, time.Duration(len(try))*o.speedWindow+4*time.Second)
-			var used string
-			bps, used, err = probeAny(probeCtx, coreAddr, try, o.speedWindow, o.speedConns, 8<<20)
-			cancel()
-			switch {
-			case err != nil:
-				// The host may refuse plain HTTP requests while still serving
-				// git, so keep the candidate and mark its speed unknown.
-				log.Printf("candidate %s (rank %d/%d): speed unknown (%v)", node, i+1, len(ranked), err)
-				bps = 0
-			default:
-				pinnedURL = used
-				log.Printf("candidate %s (rank %d/%d): %d KB/s via %s", node, i+1, len(ranked), bps/1024, used)
+			if err != nil {
+				lastErr = err
+				log.Printf("candidate %s (rank %d/%d) rejected: %v", node, i+1, len(ranked), err)
+				sess.stop()
+				continue
 			}
+			if len(probeURLs) > 0 && o.speedWindow > 0 {
+				log.Printf("candidate %s (rank %d/%d): verified, speed unknown", node, i+1, len(ranked))
+			}
+			bps = 0
 		}
 
 		if bps > bestBps {
@@ -291,7 +303,6 @@ func bootBest(ctx context.Context, o options, layout paths, coreAddr string, ran
 			break
 		}
 		if ctx.Err() != nil {
-			// Out of budget: keep what was measured and stop booting cores.
 			log.Printf("selection budget reached after %d candidates", i+1)
 			break
 		}
@@ -311,26 +322,47 @@ func bootBest(ctx context.Context, o options, layout paths, coreAddr string, ran
 	return best, bestNode, nil
 }
 
+// measure samples the target through the node, reusing the address that worked
+// for the previous candidate so later ones are not slowed down by re-probing
+// schemes that are known to yield nothing.
+func measure(ctx context.Context, o options, coreAddr string, probeURLs []string, pinned *string) (int64, error) {
+	if o.speedWindow <= 0 || len(probeURLs) == 0 {
+		return 0, nil
+	}
+	try := probeURLs
+	if *pinned != "" {
+		try = []string{*pinned}
+	}
+	probeCtx, cancel := context.WithTimeout(ctx, time.Duration(len(try))*o.speedWindow+6*time.Second)
+	defer cancel()
+
+	bps, used, err := probeAny(probeCtx, coreAddr, try, o.speedWindow, o.speedConns, 8<<20)
+	if err != nil {
+		return 0, err
+	}
+	*pinned = used
+	log.Printf("throughput %d KB/s via %s", bps/1024, used)
+	return bps, nil
+}
+
+// boot starts the core for one candidate. Both the spawn and the readiness
+// wait are bounded by the caller's budget so a stuck core cannot eat the whole
+// selection window.
 func boot(ctx context.Context, o options, layout paths, coreAddr string, node Node) (*coreSession, error) {
 	cfgPath, err := writeConfig(layout, node, coreAddr)
 	if err != nil {
 		return nil, err
 	}
-	sess, err := startCore(o.core, cfgPath, coreAddr, o.startTimeout)
-	if err != nil {
-		return nil, err
+	timeout := o.startTimeout
+	if deadline, ok := ctx.Deadline(); ok {
+		if remaining := time.Until(deadline); remaining < timeout {
+			timeout = remaining
+		}
 	}
-	if o.checkURL == "" {
-		return sess, nil
+	if timeout <= 0 {
+		return nil, errors.New("no budget left to start a core")
 	}
-
-	verifyCtx, cancel := context.WithTimeout(ctx, o.verifyTimeout)
-	defer cancel()
-	if err := verifyThroughProxy(verifyCtx, coreAddr, o.checkURL, o.verifyTimeout); err != nil {
-		sess.stop()
-		return nil, fmt.Errorf("verification through the node failed: %w", err)
-	}
-	return sess, nil
+	return startCore(ctx, o.core, cfgPath, coreAddr, timeout)
 }
 
 // supervise keeps the core alive and exits once the proxy has been unused for
@@ -410,7 +442,7 @@ type coreSession struct {
 	err  error
 }
 
-func startCore(bin, cfgPath, addr string, timeout time.Duration) (*coreSession, error) {
+func startCore(ctx context.Context, bin, cfgPath, addr string, timeout time.Duration) (*coreSession, error) {
 	cmd := exec.Command(bin, "run", "-c", cfgPath)
 	cmd.Stdout = coreOutput
 	cmd.Stderr = coreOutput
@@ -424,7 +456,7 @@ func startCore(bin, cfgPath, addr string, timeout time.Duration) (*coreSession, 
 		close(sess.done)
 	}()
 
-	if err := waitPort(addr, timeout); err != nil {
+	if err := waitPort(ctx, addr, timeout); err != nil {
 		sess.stop()
 		return nil, err
 	}
@@ -442,9 +474,12 @@ func (s *coreSession) stop() {
 	}
 }
 
-func waitPort(addr string, timeout time.Duration) error {
+func waitPort(ctx context.Context, addr string, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
+		if err := ctx.Err(); err != nil {
+			return fmt.Errorf("core did not listen on %s: %w", addr, err)
+		}
 		if conn, err := net.DialTimeout("tcp", addr, 300*time.Millisecond); err == nil {
 			_ = conn.Close()
 			return nil
