@@ -25,6 +25,10 @@ const EnvCore = "GITEA_PROXY_AGENT_CORE"
 // somewhere else, for instance when the binary lives in a read-only location.
 const EnvData = "GITEA_PROXY_AGENT_DATA"
 
+// EnvTarget tells the agent which host it is being started for, so throughput
+// can be measured against that host instead of a generic one.
+const EnvTarget = "GITEA_PROXY_AGENT_TARGET"
+
 // dataDirName is the directory next to the Gitea binary that holds the core
 // binary and everything it writes.
 const dataDirName = "sing-box"

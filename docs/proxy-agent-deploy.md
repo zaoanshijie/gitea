@@ -173,7 +173,21 @@ git -c http.proxy=socks5h://127.0.0.1:17890 ls-remote --heads https://github.com
 | 同步时没有 sing-box 进程 | 目标 host 被跳过 / 冷却期 / 探测失败 | 看 `Proxy agent unavailable (...)` 日志 |
 | `no reachable node` | 订阅过期或全部节点不可用 | 手动跑一次验证命令确认 |
 | 同步仍失败但代理正常 | 节点质量差 | 调小 `-max-delay`，或换订阅 |
+| 冷启动超过 45s 被判定失败 | 节点多、测速慢 | 加大 `GITEA_PROXY_AGENT_START_TIMEOUT=60s`，或降低候选数 |
 | gitee 走代理导致变慢 | `SKIP_HOSTS` 被覆盖 | 显式写出完整跳过列表 |
+
+### 4.1 大仓库在固定时长处被切断
+
+如果日志是 `curl 92 HTTP/2 stream ... CANCEL` / `early EOF`，且每次都在差不多的时间
+点断开（而不是差不多的大小），那是连接被中间设备按时间掐断，不是选优问题。先试：
+
+```ini
+[git.config]
+http.version = HTTP/1.1
+```
+
+HTTP/2 在长连接上更容易被中间盒重置，退回 HTTP/1.1 通常能解决。这条只影响 git 子进程，
+不影响 Gitea 自己的 HTTP 服务。
 
 单次调试点：把 `GITEA_PROXY_AGENT_IDLE` 调大（如 `10m`），方便观察进程状态；问题解决后改回。
 

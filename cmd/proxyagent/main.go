@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"net/url"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -31,12 +32,18 @@ type options struct {
 	core         string
 	data         string
 	checkURL     string
+	speedURL     string
+	target       string
+	speedWindow  time.Duration
+	speedConns   int
+	minSpeed     int64
 
 	idle          time.Duration
 	maxDelay      time.Duration
 	probeTimeout  time.Duration
 	subTimeout    time.Duration
 	startTimeout  time.Duration
+	startBudget   time.Duration
 	pickTimeout   time.Duration
 	verifyTimeout time.Duration
 	concurrency   int
@@ -70,10 +77,16 @@ func parseFlags() options {
 	flag.DurationVar(&o.probeTimeout, "probe-timeout", 3*time.Second, "per node handshake timeout")
 	flag.DurationVar(&o.subTimeout, "subscription-timeout", 20*time.Second, "subscription fetch timeout")
 	flag.DurationVar(&o.startTimeout, "start-timeout", 15*time.Second, "how long sing-box may take to bind")
-	flag.DurationVar(&o.pickTimeout, "pick-timeout", 45*time.Second, "overall budget for fetch + rank")
+	flag.DurationVar(&o.startBudget, "start-budget", 30*time.Second, "hard cap for fetch + rank + node selection, so the caller stops waiting in bounded time")
+	flag.DurationVar(&o.pickTimeout, "pick-timeout", 20*time.Second, "budget for the subscription fetch and the latency ranking")
 	flag.DurationVar(&o.verifyTimeout, "verify-timeout", 12*time.Second, "how long the verification request may take")
+	flag.StringVar(&o.target, "target", envTarget(), "host the proxy is started for; throughput is measured against it")
+	flag.StringVar(&o.speedURL, "speed-url", "", "explicit URL used to measure throughput, overrides -target")
+	flag.DurationVar(&o.speedWindow, "speed-window", 3*time.Second, "how long to sample throughput per candidate")
+	flag.IntVar(&o.speedConns, "speed-conns", 4, "parallel connections used by the throughput probe")
+	flag.Int64Var(&o.minSpeed, "min-speed", 80*1024, "accept the first candidate at least this fast (bytes/s), 0 disables the check")
 	flag.IntVar(&o.concurrency, "concurrency", 32, "concurrent probes")
-	flag.IntVar(&o.tryCandidates, "try-candidates", 3, "how many ranked nodes to try before giving up")
+	flag.IntVar(&o.tryCandidates, "try-candidates", 4, "how many ranked nodes to try before giving up")
 	flag.Parse()
 	return o
 }
@@ -106,13 +119,22 @@ func run(ctx context.Context, o options) error {
 		defer closer()
 	}
 	log.Printf("base dir %s, data dir %s, core %s", layout.base, layout.dataDir, layout.core)
+	if u := o.probeURL(); u != "" {
+		log.Printf("throughput target %s", u)
+	}
 
-	ranked, err := fetchAndRank(ctx, o)
+	// The launcher waits for the SOCKS port before handing git over, so the
+	// whole cold start has to finish in bounded time even when several
+	// candidates have to be measured.
+	startCtx, cancelStart := context.WithTimeout(ctx, o.startBudget)
+	defer cancelStart()
+
+	ranked, err := fetchAndRank(startCtx, o)
 	if err != nil {
 		return err
 	}
 
-	sess, node, err := bootBest(ctx, o, layout, coreAddr, ranked)
+	sess, node, err := bootBest(startCtx, o, layout, coreAddr, ranked)
 	if err != nil {
 		return err
 	}
@@ -130,16 +152,102 @@ func run(ctx context.Context, o options) error {
 	return supervise(ctx, o, layout, coreAddr, rl, node, sess)
 }
 
-// bootBest walks the ranked candidates until one starts and survives the
-// verification request.
+// defaultSpeedURL is only used when the launcher did not say which host the
+// proxy is for. Any HTTPS endpoint would do in that case.
+const defaultSpeedURL = "https://github.com/robots.txt"
+
+// probeURL picks what to measure: an explicit -speed-url wins, otherwise the
+// host the proxy was started for. Measuring the real target is the point --
+// a node can be fast to Cloudflare and crawl towards github.com.
+func (o options) probeURL() string {
+	urls := o.probeURLs()
+	if len(urls) == 0 {
+		return ""
+	}
+	return urls[0]
+}
+
+// probeURLs returns the URLs to measure, in order of preference.
+//
+// The target may be a bare host, a host:port or a full remote URL. For a
+// repository URL the smart-HTTP refs endpoint is preferred: that is exactly the
+// request git makes, and its response is large enough to time. A bare host is
+// probed at its root, falling back to plain HTTP because git servers often
+// answer HTTPS with a redirect and no body.
+func (o options) probeURLs() []string {
+	if o.speedURL != "" {
+		return []string{o.speedURL}
+	}
+	target := strings.TrimSpace(o.target)
+	if target == "" {
+		return []string{defaultSpeedURL}
+	}
+
+	var urls []string
+	if strings.Contains(target, "://") {
+		repo := strings.TrimSuffix(target, "/")
+		if strings.HasSuffix(repo, ".git") {
+			urls = append(urls, repo+"/info/refs?service=git-upload-pack")
+		}
+		urls = append(urls, repo+"/")
+		if u, err := url.Parse(repo); err == nil && u.Host != "" {
+			urls = append(urls, u.Scheme+"://"+u.Host+"/")
+		}
+	} else {
+		host := target
+		if h, p, err := net.SplitHostPort(target); err == nil {
+			host = h
+			if p != "" && p != "443" {
+				host = net.JoinHostPort(h, p)
+			}
+		}
+		urls = append(urls, "https://"+host+"/", "http://"+host+"/")
+	}
+	return dedupeStrings(urls)
+}
+
+func dedupeStrings(in []string) []string {
+	seen := make(map[string]bool, len(in))
+	out := in[:0]
+	for _, v := range in {
+		if v == "" || seen[v] {
+			continue
+		}
+		seen[v] = true
+		out = append(out, v)
+	}
+	return out
+}
+
+func envTarget() string { return strings.TrimSpace(os.Getenv(EnvTarget)) }
+
+// bootBest walks the ranked candidates and keeps the fastest one that starts,
+// answers a real request and moves bytes at an acceptable rate.
+//
+// Ranking alone is not enough: the endpoint with the lowest handshake latency
+// is usually the most oversubscribed, which is exactly the wrong choice for a
+// mirror clone of a few hundred megabytes.
 func bootBest(ctx context.Context, o options, layout paths, coreAddr string, ranked []Node) (*coreSession, Node, error) {
 	limit := o.tryCandidates
 	if limit <= 0 || limit > len(ranked) {
 		limit = len(ranked)
 	}
 
-	var lastErr error
+	var (
+		best     *coreSession
+		bestNode Node
+		bestBps  int64 = -1
+		lastErr  error
+
+		probeURLs = o.probeURLs()
+		pinnedURL string
+	)
+
 	for i := 0; i < limit; i++ {
+		if ctx.Err() != nil {
+			log.Printf("selection budget reached after %d candidates", i)
+			break
+		}
 		node := ranked[i]
 		sess, err := boot(ctx, o, layout, coreAddr, node)
 		if err != nil {
@@ -147,13 +255,60 @@ func bootBest(ctx context.Context, o options, layout paths, coreAddr string, ran
 			log.Printf("candidate %s rejected: %v", node, err)
 			continue
 		}
-		log.Printf("selected node %s (rank %d/%d)", node, i+1, len(ranked))
-		return sess, node, nil
+
+		bps := int64(0)
+		if o.speedWindow > 0 && len(probeURLs) > 0 {
+			try := probeURLs
+			if pinnedURL != "" {
+				try = []string{pinnedURL}
+			}
+			probeCtx, cancel := context.WithTimeout(ctx, time.Duration(len(try))*o.speedWindow+4*time.Second)
+			var used string
+			bps, used, err = probeAny(probeCtx, coreAddr, try, o.speedWindow, o.speedConns, 8<<20)
+			cancel()
+			switch {
+			case err != nil:
+				// The host may refuse plain HTTP requests while still serving
+				// git, so keep the candidate and mark its speed unknown.
+				log.Printf("candidate %s (rank %d/%d): speed unknown (%v)", node, i+1, len(ranked), err)
+				bps = 0
+			default:
+				pinnedURL = used
+				log.Printf("candidate %s (rank %d/%d): %d KB/s via %s", node, i+1, len(ranked), bps/1024, used)
+			}
+		}
+
+		if bps > bestBps {
+			if best != nil {
+				best.stop()
+			}
+			best, bestNode, bestBps = sess, node, bps
+		} else {
+			sess.stop()
+		}
+
+		if o.minSpeed > 0 && bestBps >= o.minSpeed {
+			break
+		}
+		if ctx.Err() != nil {
+			// Out of budget: keep what was measured and stop booting cores.
+			log.Printf("selection budget reached after %d candidates", i+1)
+			break
+		}
 	}
-	if lastErr == nil {
-		lastErr = errors.New("no candidate could be started")
+
+	if best == nil {
+		if lastErr == nil {
+			lastErr = errors.New("no candidate could be started")
+		}
+		return nil, Node{}, lastErr
 	}
-	return nil, Node{}, lastErr
+	if o.minSpeed > 0 && bestBps >= 0 && bestBps < o.minSpeed {
+		log.Printf("no candidate reached %d KB/s, using the fastest anyway: %s at %d KB/s",
+			o.minSpeed/1024, bestNode, bestBps/1024)
+	}
+	log.Printf("selected node %s (%d KB/s)", bestNode, bestBps/1024)
+	return best, bestNode, nil
 }
 
 func boot(ctx context.Context, o options, layout paths, coreAddr string, node Node) (*coreSession, error) {
@@ -197,11 +352,14 @@ func supervise(ctx context.Context, o options, layout paths, coreAddr string, rl
 			default:
 			}
 			log.Printf("core exited (%v), re-selecting", sess.err)
-			ranked, err := fetchAndRank(ctx, o)
+			reselectCtx, cancel := context.WithTimeout(ctx, o.startBudget)
+			ranked, err := fetchAndRank(reselectCtx, o)
 			if err != nil {
+				cancel()
 				return err
 			}
-			next, nextNode, err := bootBest(ctx, o, layout, coreAddr, ranked)
+			next, nextNode, err := bootBest(reselectCtx, o, layout, coreAddr, ranked)
+			cancel()
 			if err != nil {
 				return err
 			}
