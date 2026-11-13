@@ -82,6 +82,7 @@ func TestAgentEndToEnd(t *testing.T) {
 		"-listen", listen,
 		"-subscription", sub.URL,
 		"-core", fakecore,
+		"-speed-window", "0",
 		"-check-url", "http://verify.invalid/check",
 		"-idle", "2s",
 		"-probe-timeout", "1s",

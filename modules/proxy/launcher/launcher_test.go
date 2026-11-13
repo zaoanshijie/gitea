@@ -234,6 +234,39 @@ func TestTargetHostPort(t *testing.T) {
 	}
 }
 
+func TestRepoURL(t *testing.T) {
+	cases := []struct {
+		url  string
+		want string
+	}{
+		{
+			"https://github.com/bkaradzic/bgfx.git/info/refs?service=git-upload-pack",
+			"https://github.com/bkaradzic/bgfx.git",
+		},
+		{
+			"https://git.ffmpeg.org/ffmpeg.git/info/refs?service=git-upload-pack",
+			"https://git.ffmpeg.org/ffmpeg.git",
+		},
+		{
+			// LFS and archive downloads are not repository refs, so the caller
+			// falls back to the host instead of restarting the agent.
+			"https://github.com/a/b.git/info/lfs/objects/batch",
+			"",
+		},
+		{"https://github.com/a/b.git", ""},
+		{"https://github.com/info/refs?x=1", ""},
+	}
+	for _, tc := range cases {
+		u, err := url.Parse(tc.url)
+		if err != nil {
+			t.Fatalf("%s: %v", tc.url, err)
+		}
+		if got := repoURL(&http.Request{URL: u}); got != tc.want {
+			t.Errorf("repoURL(%s) = %q want %q", tc.url, got, tc.want)
+		}
+	}
+}
+
 func TestProbeSOCKS5(t *testing.T) {
 	addr := freeAddr(t)
 	ln, err := net.Listen("tcp", addr)

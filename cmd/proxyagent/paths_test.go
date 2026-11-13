@@ -4,11 +4,13 @@
 package main
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 )
 
 func writeExecutable(t *testing.T, path string) string {
@@ -167,5 +169,18 @@ func TestResolvePathsKeepsWorkingWhenTheDirectoryIsUnusable(t *testing.T) {
 	}
 	if len(warnings) == 0 {
 		t.Error("expected a warning about the fallback")
+	}
+}
+
+func TestProbeSpeedReportsDeadProxy(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	start := time.Now()
+	if _, err := probeSpeed(ctx, "127.0.0.1:1", "https://example.invalid/x", 300*time.Millisecond, 2, 1<<20); err == nil {
+		t.Fatal("expected an error when the proxy is not listening")
+	}
+	if elapsed := time.Since(start); elapsed > 1500*time.Millisecond {
+		t.Errorf("probe took %s, it should fail fast", elapsed)
 	}
 }

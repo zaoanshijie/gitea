@@ -13,6 +13,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"time"
 )
 
 type config struct {
@@ -99,4 +100,10 @@ func handle(conn net.Conn) {
 	}
 
 	_, _ = conn.Write([]byte(noContent))
+
+	// Drain whatever the client still has in flight. Closing a socket while
+	// unread data is pending makes the peer observe a reset instead of a clean
+	// end of stream, which shows up as a flaky "connection aborted" on Windows.
+	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	_, _ = io.Copy(io.Discard, conn)
 }

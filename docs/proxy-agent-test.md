@@ -102,8 +102,34 @@ git ls-remote --heads           24 refs  1.94s
 | `https://github.com` | 25s 超时（code 000） | 200，1.64s |
 | `git ls-remote` | 成功 | 成功 |
 
-握手 40ms 的节点可能在首个 HTTPS 请求上超时。校验步骤会对前 3 名候选逐个试，
+握手 40ms 的节点可能在首个 HTTPS 请求上超时。校验步骤会对前 4 名候选逐个试，
 失败自动换下一个，这个改动直接来自真机观测。
+
+### 4.4 按目标 host 测速（proxy.3）
+
+同一订阅、同一台机器，4 连接 × 3s 采样：
+
+| 目标 | 节点 | 吞吐 |
+|---|---|---|
+| `https://github.com/` | 圣何塞 04 | 310 KB/s |
+| `https://github.com/` | 洛杉矶 08 | 143 KB/s |
+| `https://git.ffmpeg.org/ffmpeg.git` | 圣何塞 02/03/04/07 | 105–115 KB/s |
+| `https://git.ffmpeg.org/ffmpeg.git` | 东京 01/02/03/05/09 | 读不到数据（记 0） |
+
+结论：**同地区内单节点差异大于地区差异**，且不同目标的最优节点不同，所以必须按目标实测。
+
+冷启动耗时（`https://github.com/bkaradzic/bgfx.git` 为目标）：
+
+| 场景 | 到 ready | 候选数 |
+|---|---|---|
+| 默认阈值 80 KB/s | 8.5s | 2 |
+| `-min-speed` 拉满（强制测满） | 27.7s | 6 |
+
+`-start-budget` 默认 30s，`START_TIMEOUT` 默认 45s，实测最坏情况仍在预算内。
+
+一例真实故障（proxy.2 时期，用于说明问题存在）：同一仓库连续三次迁移都在约 14MB 处
+报 `curl 92 HTTP/2 stream ... CANCEL`，选中的都是握手最快、实测仅 25 KB/s 的节点；
+换成按目标测速后，同一订阅能选到 240–310 KB/s 的节点。
 
 ## 5. 复跑
 

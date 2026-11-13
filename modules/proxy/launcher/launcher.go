@@ -36,6 +36,11 @@ type Supervisor struct {
 	// the Gitea executable, which keeps a release archive self-contained.
 	baseDir string
 
+	// target is the remote the running agent was tuned for. Node throughput is
+	// very host dependent, so a different host means a fresh selection.
+	target     string
+	targetHost string
+
 	// startMu serialises cold starts and probes so a burst of mirror jobs
 	// spawns exactly one process.
 	startMu   sync.Mutex
@@ -118,7 +123,14 @@ func (s *Supervisor) proxyFor(req *http.Request) *url.URL {
 		return s.cfg.ProxyURL
 	}
 
-	if err := s.ensureRunningLocked(); err != nil {
+	// A repository URL measures much better than a bare host: git servers
+	// often answer their root with a redirect and no body at all.
+	target := repoURL(req)
+	if target == "" {
+		target = key
+	}
+
+	if err := s.ensureRunningLocked(host, target); err != nil {
 		s.warnThrottled("start", err)
 		return nil
 	}
@@ -135,22 +147,30 @@ func (s *Supervisor) proxyFor(req *http.Request) *url.URL {
 	return s.cfg.ProxyURL
 }
 
-func (s *Supervisor) ensureRunningLocked() error {
+func (s *Supervisor) ensureRunningLocked(host, target string) error {
 	if s.cmd != nil && !s.exited.Load() {
-		if conn, err := net.DialTimeout("tcp", s.cfg.ListenAddr, time.Second); err == nil {
-			_ = conn.Close()
-			return nil
+		// The host is what matters: subsequent requests for the same remote
+		// (LFS, wiki) carry a different path and must not force a reselection.
+		if s.targetHost == host {
+			if conn, err := net.DialTimeout("tcp", s.cfg.ListenAddr, time.Second); err == nil {
+				_ = conn.Close()
+				return nil
+			}
+			// Process is alive but no longer serving; recycle it.
+		} else {
+			// The current node was chosen for another host, and node
+			// throughput is very target dependent.
+			log.Info("Proxy agent was tuned for %q, re-selecting for %q", s.targetHost, host)
 		}
-		// Process is alive but no longer serving; recycle it.
 		s.stopLocked()
 	}
 	if time.Now().Before(s.coolUntil) {
 		return fmt.Errorf("cooling down after a failed start")
 	}
-	return s.startLocked()
+	return s.startLocked(host, target)
 }
 
-func (s *Supervisor) startLocked() error {
+func (s *Supervisor) startLocked(host, target string) error {
 	args := make([]string, 0, len(s.cfg.Args))
 	for _, a := range s.cfg.Args {
 		a = strings.ReplaceAll(a, "{addr}", s.cfg.ListenAddr)
@@ -165,6 +185,11 @@ func (s *Supervisor) startLocked() error {
 	if s.baseDir != "" && os.Getenv(EnvBaseDir) == "" {
 		cmd.Env = append(cmd.Env, EnvBaseDir+"="+s.baseDir)
 	}
+	// Measure throughput against the remote that is asking, not a generic one.
+	if target != "" && os.Getenv(EnvTarget) == "" {
+		cmd.Env = append(cmd.Env, EnvTarget+"="+target)
+	}
+	s.target, s.targetHost = target, host
 	cmd.Stdout = &lineWriter{prefix: "proxy agent"}
 	cmd.Stderr = &lineWriter{prefix: "proxy agent"}
 	setProcAttr(cmd)
@@ -306,6 +331,31 @@ func hostPatternMatch(pattern, host string) bool {
 	return false
 }
 
+// repoURL reconstructs the remote repository URL from a git HTTP request.
+//
+// Git talks to <repo>/info/refs first, so that request is enough to learn the
+// exact repository the operator cares about. Anything else (LFS, archives)
+// returns "" and the caller falls back to the plain host.
+func repoURL(req *http.Request) string {
+	if req == nil || req.URL == nil {
+		return ""
+	}
+	u := *req.URL
+	idx := strings.Index(u.Path, "/info/refs")
+	if idx < 0 {
+		return ""
+	}
+	repo := strings.TrimSuffix(u.Path[:idx], "/")
+	if repo == "" {
+		return ""
+	}
+	u.Path, u.RawPath, u.RawQuery, u.Fragment, u.User = repo, "", "", "", nil
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return ""
+	}
+	return u.String()
+}
+
 func targetHostPort(req *http.Request) (host, port string) {
 	host = req.URL.Hostname()
 	if host == "" {
@@ -373,6 +423,9 @@ var _ io.Writer = (*lineWriter)(nil)
 // EnvBaseDir tells the agent which directory the Gitea executable lives in, so
 // it can find <base>/sing-box/ without any per-instance configuration.
 const EnvBaseDir = EnvPrefix + "BASE_DIR"
+
+// EnvTarget carries the host the proxy is being started for.
+const EnvTarget = EnvPrefix + "TARGET"
 
 // baseDir is the directory of the running Gitea binary. Setting EnvBaseDir
 // explicitly wins, which keeps the core somewhere else when needed.
