@@ -44,8 +44,7 @@ type Supervisor struct {
 	// startMu serialises cold starts and probes so a burst of mirror jobs
 	// spawns exactly one process.
 	startMu   sync.Mutex
-	cmd       *exec.Cmd
-	exited    atomic.Bool
+	proc      *proc
 	coolUntil time.Time
 	lastLogAt time.Time
 	lastLog   string
@@ -53,6 +52,26 @@ type Supervisor struct {
 	cacheMu  sync.RWMutex
 	verified map[string]time.Time
 }
+
+// proc is one agent process together with the channels describing its
+// lifecycle.
+//
+// Tying the channels to the process instead of to the supervisor is what keeps
+// a restart honest: the dying process closes its own done channel, so it can
+// never be mistaken for the one that replaced it. Before this, a dying agent
+// still held the listen port long enough for the next cold start to see it as
+// "ready", and its exit marked the fresh agent as dead.
+type proc struct {
+	cmd   *exec.Cmd
+	done  chan struct{} // closed once the process has been reaped
+	ready chan struct{} // closed when the agent printed its ready line
+	err   error         // set before done is closed
+	once  sync.Once
+}
+
+// markReady reports that the agent is serving. It is safe to call repeatedly:
+// the agent may announce itself more than once if it re-selects a node.
+func (p *proc) markReady() { p.once.Do(func() { close(p.ready) }) }
 
 var global atomic.Pointer[Supervisor]
 
@@ -135,11 +154,17 @@ func (s *Supervisor) proxyFor(req *http.Request) *url.URL {
 		return nil
 	}
 
+	started := s.proc
 	probeCtx, cancel := context.WithTimeout(context.Background(), s.cfg.ProbeTimeout)
 	defer cancel()
 	if err := probeSOCKS5(probeCtx, s.cfg.ListenAddr, key); err != nil {
 		s.warnThrottled("probe", fmt.Errorf("%s: %w", key, err))
-		s.stopLocked()
+		// Only drop the instance that failed the probe: a retarget may have
+		// replaced it while the probe was running, and killing the replacement
+		// would throw away a working agent.
+		if s.proc == started {
+			s.stopLocked()
+		}
 		return nil
 	}
 
@@ -148,21 +173,28 @@ func (s *Supervisor) proxyFor(req *http.Request) *url.URL {
 }
 
 func (s *Supervisor) ensureRunningLocked(host, target string) error {
-	if s.cmd != nil && !s.exited.Load() {
-		// The host is what matters: subsequent requests for the same remote
-		// (LFS, wiki) carry a different path and must not force a reselection.
-		if s.targetHost == host {
-			if conn, err := net.DialTimeout("tcp", s.cfg.ListenAddr, time.Second); err == nil {
-				_ = conn.Close()
-				return nil
+	if p := s.proc; p != nil {
+		select {
+		case <-p.done:
+			// Already gone; fall through and start a fresh one.
+		default:
+			// The host is what matters: subsequent requests for the same remote
+			// (LFS, wiki) carry a different path and must not force a reselection.
+			if s.targetHost == host {
+				if conn, err := net.DialTimeout("tcp", s.cfg.ListenAddr, time.Second); err == nil {
+					_ = conn.Close()
+					return nil
+				}
+				// Process is alive but no longer serving; recycle it.
+			} else {
+				// The current node was chosen for another host, and node
+				// throughput is very target dependent.
+				log.Info("Proxy agent was tuned for %q, re-selecting for %q", s.targetHost, host)
 			}
-			// Process is alive but no longer serving; recycle it.
-		} else {
-			// The current node was chosen for another host, and node
-			// throughput is very target dependent.
-			log.Info("Proxy agent was tuned for %q, re-selecting for %q", s.targetHost, host)
+			// stopLocked waits for the process to be reaped, so the port and
+			// the core cache are free before the next instance starts.
+			s.stopLocked()
 		}
-		s.stopLocked()
 	}
 	if time.Now().Before(s.coolUntil) {
 		return fmt.Errorf("cooling down after a failed start")
@@ -190,8 +222,10 @@ func (s *Supervisor) startLocked(host, target string) error {
 		cmd.Env = append(cmd.Env, EnvTarget+"="+target)
 	}
 	s.target, s.targetHost = target, host
-	cmd.Stdout = &lineWriter{prefix: "proxy agent"}
-	cmd.Stderr = &lineWriter{prefix: "proxy agent"}
+
+	p := &proc{ready: make(chan struct{}), done: make(chan struct{})}
+	w := &lineWriter{prefix: "proxy agent", onReady: p.markReady}
+	cmd.Stdout, cmd.Stderr = w, w
 	setProcAttr(cmd)
 
 	if err := cmd.Start(); err != nil {
@@ -199,37 +233,67 @@ func (s *Supervisor) startLocked(host, target string) error {
 		return fmt.Errorf("exec %s: %w", s.cfg.Command, err)
 	}
 
-	s.cmd = cmd
-	s.exited.Store(false)
-	go s.reap(cmd)
+	p.cmd = cmd
+	s.proc = p
+	go s.reap(p)
 
 	log.Info("Proxy agent starting: pid=%d", cmd.Process.Pid)
 
-	deadline := time.Now().Add(s.cfg.StartTimeout)
-	for time.Now().Before(deadline) {
-		if s.exited.Load() {
-			s.coolDown()
-			return fmt.Errorf("process exited during startup")
-		}
-		if conn, err := net.DialTimeout("tcp", s.cfg.ListenAddr, 500*time.Millisecond); err == nil {
-			_ = conn.Close()
+	// Readiness is taken from the agent itself: it prints "ready listen=..."
+	// once the relay is bound, which is the only signal that cannot come from
+	// a previous instance. The port poll stays as a safety net for a build
+	// that does not announce itself.
+	timeout := time.NewTimer(s.cfg.StartTimeout)
+	defer timeout.Stop()
+	poll := time.NewTicker(200 * time.Millisecond)
+	defer poll.Stop()
+	for {
+		select {
+		case <-p.ready:
 			log.Info("Proxy agent ready on %s", s.cfg.ListenAddr)
 			return nil
+		case <-p.done:
+			s.coolDown()
+			return fmt.Errorf("process exited during startup: %v", p.err)
+		case <-timeout.C:
+			if s.proc == p {
+				s.stopLocked()
+			}
+			s.coolDown()
+			return fmt.Errorf("not listening on %s within %s", s.cfg.ListenAddr, s.cfg.StartTimeout)
+		case <-poll.C:
+			if conn, err := net.DialTimeout("tcp", s.cfg.ListenAddr, 500*time.Millisecond); err == nil {
+				_ = conn.Close()
+				log.Info("Proxy agent ready on %s", s.cfg.ListenAddr)
+				return nil
+			}
 		}
-		time.Sleep(200 * time.Millisecond)
 	}
-
-	s.stopLocked()
-	s.coolDown()
-	return fmt.Errorf("not listening on %s within %s", s.cfg.ListenAddr, s.cfg.StartTimeout)
 }
 
-func (s *Supervisor) reap(cmd *exec.Cmd) {
-	err := cmd.Wait()
-	s.exited.Store(true)
-	s.clearVerified()
-	if err != nil {
-		log.Warn("Proxy agent exited: %v", err)
+// reap reaps one agent and updates the shared state only while that agent is
+// still the current one. A predecessor exiting after a replacement has started
+// must not mark the replacement dead.
+func (s *Supervisor) reap(p *proc) {
+	p.err = p.cmd.Wait()
+	// Close before taking the lock: stopLocked holds startMu while waiting for
+	// exactly this channel.
+	close(p.done)
+
+	s.startMu.Lock()
+	current := s.proc == p
+	if current {
+		s.proc = nil
+		s.clearVerified()
+	}
+	s.startMu.Unlock()
+
+	if !current {
+		log.Info("Proxy agent pid=%d exited after being replaced", p.cmd.Process.Pid)
+		return
+	}
+	if p.err != nil {
+		log.Warn("Proxy agent exited: %v", p.err)
 	} else {
 		log.Info("Proxy agent exited after being idle")
 	}
@@ -241,16 +305,41 @@ func (s *Supervisor) stop() {
 	s.stopLocked()
 }
 
+// stopLocked terminates the current agent and waits until it is really gone.
+//
+// Waiting matters: the agent owns the listen port and the core cache, so
+// starting a replacement while the predecessor is still shutting down produces
+// a lost race -- the new start sees the old socket, believes the agent is
+// ready, and the probe then talks to a dying process.
 func (s *Supervisor) stopLocked() {
-	cmd := s.cmd
-	if cmd == nil || cmd.Process == nil || s.exited.Load() {
-		s.cmd = nil
+	p := s.proc
+	if p == nil {
 		return
 	}
-	terminate(cmd)
-	s.cmd = nil
+	s.proc = nil
 	s.clearVerified()
+
+	terminate(p.cmd)
+	select {
+	case <-p.done:
+		return
+	case <-time.After(stopGrace):
+	}
+
+	log.Warn("Proxy agent pid=%d ignored the stop request, killing it", p.cmd.Process.Pid)
+	if p.cmd.Process != nil {
+		_ = p.cmd.Process.Kill()
+	}
+	select {
+	case <-p.done:
+	case <-time.After(time.Second):
+		log.Warn("Proxy agent pid=%d is still not reaped", p.cmd.Process.Pid)
+	}
 }
+
+// stopGrace bounds how long a cold stop may take before it is escalated.
+// terminate already escalates on its own, this is the outer safety net.
+const stopGrace = 6 * time.Second
 
 func (s *Supervisor) coolDown() {
 	s.coolUntil = time.Now().Add(30 * time.Second)
@@ -393,10 +482,12 @@ func probeSOCKS5(ctx context.Context, proxyAddr, target string) error {
 }
 
 // lineWriter forwards the agent's own output into the Gitea log; without it a
-// failed start is a black box.
+// failed start is a black box. It also watches for the agent's ready line,
+// which is the only announcement a previous instance cannot fake.
 type lineWriter struct {
-	prefix string
-	buf    []byte
+	prefix  string
+	onReady func()
+	buf     []byte
 }
 
 func (w *lineWriter) Write(p []byte) (int, error) {
@@ -408,6 +499,9 @@ func (w *lineWriter) Write(p []byte) (int, error) {
 		}
 		line := strings.TrimRight(string(w.buf[:i]), "\r")
 		if line != "" {
+			if w.onReady != nil && isReadyLine(line) {
+				w.onReady()
+			}
 			log.Info("[%s] %s", w.prefix, line)
 		}
 		w.buf = w.buf[i+1:]
@@ -416,6 +510,13 @@ func (w *lineWriter) Write(p []byte) (int, error) {
 		w.buf = nil
 	}
 	return len(p), nil
+}
+
+// isReadyLine matches the machine readable line the agent prints once its relay
+// is bound. The human readable log line carries a timestamp and a prefix, so
+// the two can never be confused.
+func isReadyLine(line string) bool {
+	return strings.HasPrefix(line, "ready listen=")
 }
 
 var _ io.Writer = (*lineWriter)(nil)

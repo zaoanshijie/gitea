@@ -184,3 +184,56 @@ func TestProbeSpeedReportsDeadProxy(t *testing.T) {
 		t.Errorf("probe took %s, it should fail fast", elapsed)
 	}
 }
+
+// TestInstanceFilesAreScopedPerCore pins the fix for "initialize cache-file:
+// timeout": two cores must never share a cache, because sing-box locks it.
+func TestInstanceFilesAreScopedPerCore(t *testing.T) {
+	p := paths{dataDir: t.TempDir()}
+
+	if a, b := p.instanceCacheFile("1-1"), p.instanceCacheFile("1-2"); a == b {
+		t.Fatalf("two instances share the cache file %q", a)
+	}
+	if a, b := p.instanceConfigFile("1-1"), p.instanceConfigFile("1-2"); a == b {
+		t.Fatalf("two instances share the config file %q", a)
+	}
+	for _, name := range []string{p.instanceCacheFile("7-3"), p.instanceConfigFile("7-3")} {
+		if !strings.HasPrefix(name, p.dataDir) {
+			t.Errorf("%q escapes the data directory", name)
+		}
+	}
+}
+
+func TestRemoveStaleInstanceFiles(t *testing.T) {
+	dir := t.TempDir()
+	p := paths{dataDir: dir}
+
+	oldCache := p.instanceCacheFile("1-1")
+	oldCfg := p.instanceConfigFile("1-1")
+	freshCache := p.instanceCacheFile("2-1")
+	keep := filepath.Join(dir, "agent.log")
+	past := time.Now().Add(-3 * time.Hour)
+	for _, f := range []string{oldCache, oldCfg, freshCache, keep} {
+		if err := os.WriteFile(f, []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Chtimes(oldCache, past, past); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(oldCfg, past, past); err != nil {
+		t.Fatal(err)
+	}
+
+	p.removeStale(2 * time.Hour)
+
+	for _, gone := range []string{oldCache, oldCfg} {
+		if _, err := os.Stat(gone); !os.IsNotExist(err) {
+			t.Errorf("%q should have been removed as stale", gone)
+		}
+	}
+	for _, kept := range []string{freshCache, keep} {
+		if _, err := os.Stat(kept); err != nil {
+			t.Errorf("%q must be kept: %v", kept, err)
+		}
+	}
+}

@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
 )
 
 // EnvBaseDir is exported by the Gitea launcher so the agent knows where the
@@ -35,10 +36,10 @@ const dataDirName = "sing-box"
 
 // paths is the resolved layout:
 //
-//	<base>/sing-box/sing-box           core binary (unless overridden)
-//	<base>/sing-box/agent-sing-box.json  generated core config
-//	<base>/sing-box/cache.db             core cache
-//	<base>/sing-box/agent.log            agent log
+//	<base>/sing-box/sing-box                    core binary (unless overridden)
+//	<base>/sing-box/agent-sing-box-<id>.json    per-instance core config
+//	<base>/sing-box/cache-<id>.db               per-instance core cache
+//	<base>/sing-box/agent.log                   agent log
 type paths struct {
 	base      string
 	dataDir   string
@@ -57,6 +58,49 @@ func (p paths) configFile() string {
 	return filepath.Join(p.dataDir, "agent-sing-box.json")
 }
 func (p paths) logFile() string { return filepath.Join(p.dataDir, "agent.log") }
+
+// instanceConfigFile returns the core configuration of one core instance.
+//
+// Every instance gets its own file: the agent writes the config right before
+// spawning a core, and a second agent doing the same would otherwise overwrite
+// the node list of the core that is already running.
+func (p paths) instanceConfigFile(tag string) string {
+	return filepath.Join(p.dataDir, "agent-sing-box-"+tag+".json")
+}
+
+// instanceCacheFile returns the cache path of one core instance.
+//
+// sing-box takes an exclusive lock on its cache file, so a single shared
+// cache.db turns any overlap between two cores into a hard start failure
+// ("initialize cache-file: timeout"). That is not hypothetical: it happened
+// when a retarget overlapped the shutdown of the previous agent, and the cores
+// that failed to start are the ones that then reported "speed unknown". The
+// cache only holds DNS answers and rule sets, so scoping it to the instance
+// costs nothing.
+func (p paths) instanceCacheFile(tag string) string {
+	return filepath.Join(p.dataDir, "cache-"+tag+".db")
+}
+
+// removeStale drops the config and cache files of instances that are long
+// gone, so repeated starts do not accumulate files next to the binary.
+func (p paths) removeStale(olderThan time.Duration) {
+	entries, err := os.ReadDir(p.dataDir)
+	if err != nil {
+		return
+	}
+	cutoff := time.Now().Add(-olderThan)
+	for _, e := range entries {
+		name := e.Name()
+		if !strings.HasPrefix(name, "cache-") && !strings.HasPrefix(name, "agent-sing-box-") {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil || !info.Mode().IsRegular() || info.ModTime().After(cutoff) {
+			continue
+		}
+		_ = os.Remove(filepath.Join(p.dataDir, name))
+	}
+}
 
 // resolvePaths works out where the core lives and where it may write.
 //

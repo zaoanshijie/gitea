@@ -5,17 +5,20 @@ package launcher
 
 import (
 	"flag"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"testing"
 	"time"
 )
 
 var helperListen = flag.String("launcher-helper-listen", "", "internal: serve a fake socks endpoint")
 var helperExit = flag.Bool("launcher-helper-exit", false, "internal: exit immediately")
+var helperReady = flag.String("launcher-helper-ready", "", "internal: announce readiness without listening")
 
 // TestHelperSocks doubles as a fake SOCKS5 endpoint when the supervisor spawns
 // this very test binary. It is a no-op during a normal test run.
@@ -35,6 +38,16 @@ func TestHelperExit(t *testing.T) {
 		return
 	}
 	os.Exit(0)
+}
+
+// TestHelperReady announces readiness without binding anything, so a test can
+// tell the agent's own signal apart from a port that happens to be open.
+func TestHelperReady(t *testing.T) {
+	if *helperReady == "" {
+		return
+	}
+	fmt.Printf("ready listen=%s node=stand-in\n", *helperReady)
+	select {}
 }
 
 func serveSocks(ln net.Listener) {
@@ -141,11 +154,11 @@ func TestSupervisorStartsAndCaches(t *testing.T) {
 	}
 
 	// The second call must reuse the cache instead of spawning again.
-	first := s.cmd
+	first := s.proc
 	if second := s.proxyFor(githubRequest()); second == nil {
 		t.Fatal("expected the cached proxy to be returned")
 	}
-	if s.cmd != first {
+	if s.proc != first {
 		t.Error("the supervisor should not spawn a second process")
 	}
 }
@@ -171,6 +184,85 @@ func TestSupervisorFallsBackWhenBinaryMissing(t *testing.T) {
 
 	if got := s.proxyFor(githubRequest()); got != nil {
 		t.Fatalf("expected a direct connection, got %v", got)
+	}
+}
+
+// TestStartTrustsTheReadyLine pins the fix for the retarget storm: readiness
+// must come from the agent itself, not from whoever answers on the port.
+func TestStartTrustsTheReadyLine(t *testing.T) {
+	addr := freeAddr(t)
+	s := newTestSupervisor(addr, "-test.run=^TestHelperReady$", "-launcher-helper-ready", addr)
+	s.cfg.StartTimeout = 10 * time.Second
+	defer s.stop()
+
+	start := time.Now()
+	if err := s.startLocked("github.com", "github.com"); err != nil {
+		t.Fatalf("start failed: %v", err)
+	}
+	// Nothing is listening on addr, so only the ready line can end the wait.
+	if took := time.Since(start); took > 5*time.Second {
+		t.Fatalf("start returned after %s, it must use the agent's announcement", took)
+	}
+	if s.proc == nil {
+		t.Fatal("expected a running agent")
+	}
+}
+
+// TestRetargetWaitsForTheOldInstance checks that a host change reaps the old
+// agent before the new one starts. Overlapping instances fight over the port
+// and the core cache, and the loser used to be killed by the winner's probe.
+func TestRetargetWaitsForTheOldInstance(t *testing.T) {
+	addr := freeAddr(t)
+	s := newTestSupervisor(addr, "-test.run=^TestHelperSocks$", "-launcher-helper-listen", addr)
+	defer s.stop()
+
+	if got := s.proxyFor(githubRequest()); got == nil {
+		t.Fatal("expected the proxy to be used")
+	}
+	first := s.proc
+
+	other := &http.Request{URL: &url.URL{Scheme: "https", Host: "gitlab.freedesktop.org"}}
+	if got := s.proxyFor(other); got == nil {
+		t.Fatal("expected the proxy after retargeting")
+	}
+	if s.proc == first {
+		t.Fatal("retargeting must start a new agent")
+	}
+	select {
+	case <-first.done:
+	default:
+		t.Error("the previous agent must be reaped before the replacement starts")
+	}
+}
+
+// TestReapLeavesTheReplacementAlone covers the second half of the race: the
+// predecessor's exit used to mark the fresh agent as dead.
+func TestReapLeavesTheReplacementAlone(t *testing.T) {
+	s := &Supervisor{verified: make(map[string]time.Time)}
+
+	old := &proc{
+		cmd:   exec.Command(os.Args[0], "-test.run=^TestHelperExit$", "-launcher-helper-exit"),
+		done:  make(chan struct{}),
+		ready: make(chan struct{}),
+	}
+	if err := old.cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	s.proc = old
+	go s.reap(old)
+
+	fresh := &proc{done: make(chan struct{}), ready: make(chan struct{})}
+	s.proc = fresh
+
+	select {
+	case <-old.done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the helper never exited")
+	}
+	time.Sleep(300 * time.Millisecond)
+
+	if s.proc != fresh {
+		t.Error("a reaped predecessor must not clear the agent that replaced it")
 	}
 }
 

@@ -216,12 +216,51 @@ SHA256SUMS
 | 启动日志 | `base-dir="/tmp/sc"`（取自 Gitea 自身，而非 agent 位置） |
 | agent 自述 | `base dir /tmp/sc, data dir /tmp/sc/sing-box, core /tmp/sc/sing-box/sing-box` |
 | 真实镜像（`octocat/Hello-World`） | `201`，6.5s，仓库 21MB、3 个分支，直连该 host 时常失败 |
-| data 目录产物 | `sing-box`、`cache.db`、`agent-sing-box.json`、`agent.log` 四个文件 |
-| `sing-box check -c agent-sing-box.json` | `config OK`（`experimental.cache_file` 写法有效） |
+| data 目录产物 | 运行期：`sing-box`、`cache-<pid>-<n>.db`、`agent-sing-box-<pid>-<n>.json`、`agent.log`；退出后实例文件被清理，只剩 `sing-box` 与 `agent.log` |
+| `sing-box check -c agent-sing-box-<pid>-<n>.json` | `config OK`（`experimental.cache_file` 写法有效） |
 | agent 自身目录 | 未被创建 `sing-box/` 子目录，说明未以自身位置推断 |
 | 空闲退出（`IDLE=60s`） | 61s 后 agent 退出，`pgrep sing-box` 为空，无孤儿进程 |
 | 移除核心后触发同步 | agent 打印 `fatal: no sing-box binary found: expected /tmp/sc/sing-box/sing-box`，退出码 1；launcher 记 `falling back to a direct connection`；Gitea 首页仍 200 |
 | 恢复核心后再同步 | `201`，1.5s，自动重新拉起 |
+
+## 6.2 proxy.5 回归（实例隔离与就绪判定）
+
+针对 2026-11-13 线上出现的 `initialize cache-file: timeout`、0 KB/s 选点、以及切换目标时
+误杀新实例三个问题，proxy.5 的回归如下。
+
+### 单元 / 端到端（`go test`）
+
+| 用例 | 覆盖点 |
+|---|---|
+| `TestStartTrustsTheReadyLine` | 端口无人监听时，仅凭 agent 的 `ready listen=` 行就判定就绪（不再靠拨端口） |
+| `TestRetargetWaitsForTheOldInstance` | 换目标时旧实例必须已 reap，新实例才启动 |
+| `TestReapLeavesTheReplacementAlone` | 旧进程退出不会把替换它的新进程标记为已死 |
+| `TestInstanceFilesAreScopedPerCore` | 两个核心实例的配置/缓存路径互不相同 |
+| `TestRemoveStaleInstanceFiles` | 2 小时前的实例文件被清理，新文件与 `agent.log` 保留 |
+| `TestAgentRefusesANodeWithoutThroughput` | 节点能过健康检查但搬不动数据时，agent 拒绝服务并退出非 0 |
+| `TestAgentServesANodeThatMovesData` | 同一路径的正例：读到实体后正常就绪 |
+
+### 真机（192.168.15.114，linux/amd64，真实订阅 + 真实 sing-box 1.14.4）
+
+```bash
+./gitea-proxy-agent -listen 127.0.0.1:17990 -subscription "<订阅>" \
+  -idle 25s -start-budget 70s
+```
+
+| 检查 | 结果 |
+|---|---|
+| 选点 | `throughput 186 KB/s via https://github.com/` → `selected node ...` |
+| 经代理访问 github | `code=200 size=525330 t=0.71s` |
+| `git ls-remote https://github.com/go-gitea/gitea.git HEAD` | 返回 `53aafd7e...`，克隆前置链路可用 |
+| 运行期实例文件 | `agent-sing-box-36144-1.json`、`cache-36144-1.db` |
+| 空闲退出后 | 实例文件被删除，只剩 `sing-box` 与 `agent.log`，退出码 0 |
+| **双实例并发**（同一数据目录，端口 17990/17995） | 两个核心各自持有 `cache-<pid>-<n>.db`，**没有** `initialize cache-file` 失败；两路请求均 `code=200` |
+
+### 已知限制补充
+
+`bind: address already in use` 曾在「候选核心仍存活时就启动下一个候选」时出现
+（候选被 park 但核心没关）。proxy.5 起候选之间先 `stop` 再 `boot`，并在 `startCore`
+前用 `waitPortFree` 等待端口释放，该现象不再出现。
 
 ## 7. 未覆盖 / 已知限制
 

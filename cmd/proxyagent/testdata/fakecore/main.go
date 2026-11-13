@@ -13,8 +13,20 @@ import (
 	"io"
 	"net"
 	"os"
+	"strconv"
 	"time"
 )
+
+// bodySize makes the stand-in answer with a real body instead of 204, which is
+// what the throughput probe needs in order to measure anything.
+var bodySize = func() int64 {
+	if v := os.Getenv("FAKECORE_BODY"); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil && n > 0 {
+			return n
+		}
+	}
+	return 0
+}()
 
 type config struct {
 	Inbounds []struct {
@@ -65,6 +77,38 @@ func main() {
 
 const noContent = "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
 
+// chunk is reused so a body answer does not allocate per connection.
+var chunk = func() []byte {
+	b := make([]byte, 32<<10)
+	for i := range b {
+		b[i] = 'x'
+	}
+	return b
+}()
+
+// answer writes either a real body or the empty 204, depending on the mode.
+func answer(conn net.Conn) error {
+	if bodySize <= 0 {
+		_, err := conn.Write([]byte(noContent))
+		return err
+	}
+	header := fmt.Sprintf("HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: %d\r\nConnection: close\r\n\r\n", bodySize)
+	if _, err := conn.Write([]byte(header)); err != nil {
+		return err
+	}
+	for written := int64(0); written < bodySize; {
+		n := int64(len(chunk))
+		if left := bodySize - written; left < n {
+			n = left
+		}
+		if _, err := conn.Write(chunk[:n]); err != nil {
+			return err
+		}
+		written += n
+	}
+	return nil
+}
+
 func handle(conn net.Conn) {
 	defer conn.Close()
 	buf := make([]byte, 512)
@@ -99,7 +143,7 @@ func handle(conn net.Conn) {
 		return
 	}
 
-	_, _ = conn.Write([]byte(noContent))
+	_ = answer(conn)
 
 	// Drain whatever the client still has in flight. Closing a socket while
 	// unread data is pending makes the peer observe a reset instead of a clean
