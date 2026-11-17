@@ -1,4 +1,4 @@
-# 设计文档：Gitea 按需代理（28.3.0）
+# 设计文档：Gitea 按需代理（28.4.0）
 
 ## 1. 目标与约束
 
@@ -35,9 +35,9 @@ git 子进程  ──http.proxy──▶  127.0.0.1:<随机端口>（services/gi
 | `modules/proxy/launcher/config.go` | 新增，环境变量解析与校验 |
 | `modules/proxy/launcher/launcher.go` | 新增，进程托管与探测 |
 | `modules/proxy/launcher/proc_{unix,windows}.go` | 新增，进程组与权限差异 |
-| `modules/egress/policies.go` | +10 行，插入一个分支 |
-| `services/gitproxy/server.go` | +18 行，拨号/CONNECT 超时改为可配置（默认仍是 30s） |
-| `routers/init.go` | +4 行，初始化与超时联调 |
+| `modules/egress/policies.go` | +7 行，插入一个分支 |
+| `services/gitproxy/server.go` | +25/-2 行，拨号/CONNECT 超时改为可配置（默认仍是 30s） |
+| `routers/init.go` | +5 行，初始化与超时联调 |
 
 `git` 的任何调用点都没有改动。
 

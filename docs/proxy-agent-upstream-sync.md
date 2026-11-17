@@ -7,17 +7,17 @@
 
 | 项 | 值 |
 |---|---|
-| 基线版本 | `v28.3.0` |
+| 基线版本 | `v28.4.0` |
 | 改动分支 | `proxy-agent`（同时也是默认分支） |
-| 提交数 | 3 个（launcher / agent / docs+ci） |
-| 改动文件 | 新增 24 个，修改 2 个（`policies.go` +10 行、`init.go` +2 行） |
-| 上游 tag | 完整 264 个（fork 时由 GitHub 服务端同步） |
+| 提交数 | 13 个（launcher / agent / gitproxy 超时 / docs+ci） |
+| 改动文件 | 新增 27 个，修改 4 个（`policies.go` +7 行、`init.go` +5 行、`gitproxy/server.go` +25/-2 行、其测试 +26 行） |
+| 上游 tag | 完整 271 个（fork 时由 GitHub 服务端同步） |
 
 查看相对基线的差异：
 
 ```bash
-git log --oneline v28.3.0..proxy-agent
-git diff --stat v28.3.0..proxy-agent
+git log --oneline v28.4.0..proxy-agent
+git diff --stat v28.4.0..proxy-agent
 ```
 
 预期只有这些：
@@ -25,15 +25,16 @@ git diff --stat v28.3.0..proxy-agent
 ```
  cmd/proxyagent/**                      新增
  modules/proxy/launcher/**              新增
- modules/egress/policies.go             +10 行
- routers/init.go                        +2 行
+ modules/egress/policies.go             +7 行
+ routers/init.go                        +5 行
+ services/gitproxy/server.go            +25/-2 行
  docs/proxy-agent-*.md                  新增
  .github/workflows/build-release.yml    新增
 ```
 
 ## 2. 升级到新版本
 
-以官方发布 `v28.4.0` 为例：
+以官方发布 `v28.5.0` 为例：
 
 ```bash
 git clone git@github.com:zaoanshijie/gitea.git
@@ -44,15 +45,16 @@ git fetch upstream --tags
 git checkout proxy-agent
 
 # 把改动提交整体挪到新 tag 上
-git rebase v28.4.0
+git rebase v28.5.0
 ```
 
-冲突几乎只会出现在这两处：
+冲突几乎只会出现在这三处：
 
 | 文件 | 冲突原因 | 处理 |
 |---|---|---|
 | `modules/egress/policies.go` | `gitProxySelector()` 被上游改动 | 保留上游新逻辑，在 `[proxy] PROXY_URL` 分支**之后**插入 `if launcher.Enabled() { return launcher.ProxyFor, nil }` |
 | `routers/init.go` | 初始化顺序调整 | 保证 `launcher.Init(ctx)` 在 `gitproxy_service.Run` 之前执行 |
+| `services/gitproxy/server.go` | 上游改了拨号/CONNECT 超时 | 保留上游实现，把硬编码的 30s 换回 `proxyDialer.Timeout` 与 `connectTimeout`，并保留 `SetDialTimeout` |
 
 新增的两个目录（`modules/proxy/launcher/`、`cmd/proxyagent/`）上游没有同名文件，不会冲突。
 
@@ -74,8 +76,8 @@ grep -n "launcher.Enabled()" modules/egress/policies.go
 
 # 4. 推送并让 CI 出包
 git push --force-with-lease origin proxy-agent
-git tag v28.4.0-proxy.1
-git push origin v28.4.0-proxy.1
+git tag v28.5.0-proxy.1
+git push origin v28.5.0-proxy.1
 ```
 
 tag 名必须是 `v<版本>-proxy.<序号>`，CI 会把它还原成 `<版本>` 写进二进制的 `main.Version`，

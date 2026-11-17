@@ -13,10 +13,10 @@
 产物：
 
 ```
-gitea-28.3.0-linux-amd64            # 自包含，前端资源已嵌入
-gitea-28.3.0-linux-arm64
-gitea-proxy-agent-28.3.0-linux-amd64
-gitea-proxy-agent-28.3.0-linux-arm64
+gitea-28.4.0-linux-amd64            # 自包含，前端资源已嵌入
+gitea-28.4.0-linux-arm64
+gitea-proxy-agent-28.4.0-linux-amd64
+gitea-proxy-agent-28.4.0-linux-arm64
 SHA256SUMS
 ```
 
@@ -27,8 +27,8 @@ SHA256SUMS
 发布新版本：
 
 ```bash
-git tag v28.3.0-proxy.1
-git push origin v28.3.0-proxy.1
+git tag v28.4.0-proxy.1
+git push origin v28.4.0-proxy.1
 ```
 
 ## 2. 服务器部署
@@ -112,8 +112,8 @@ sudo systemctl stop gitea
 
 # 2. 备份并替换二进制
 sudo cp /usr/local/bin/gitea /usr/local/bin/gitea.bak
-sudo install -m 0755 gitea-28.3.0-linux-amd64 /usr/local/bin/gitea
-sudo install -m 0755 gitea-proxy-agent-28.3.0-linux-amd64 /usr/local/bin/gitea-proxy-agent
+sudo install -m 0755 gitea-28.4.0-linux-amd64 /usr/local/bin/gitea
+sudo install -m 0755 gitea-proxy-agent-28.4.0-linux-amd64 /usr/local/bin/gitea-proxy-agent
 
 # 3. 核心放到 <gitea目录>/sing-box/ 下，并把目录交给运行用户
 sudo mkdir -p /usr/local/bin/sing-box
