@@ -146,11 +146,13 @@ func TestResolvePathsKeepsWorkingWhenTheDirectoryIsUnusable(t *testing.T) {
 	t.Setenv(EnvCore, "")
 	core := writeExecutable(t, filepath.Join(base, dataDirName, coreName()))
 
-	// A read-only base directory: the core is still found, state moves away.
-	if err := os.Chmod(base, 0o500); err != nil {
+	// A data directory that holds the core but denies writes, like a root-owned
+	// install: the core is still found, state moves away.
+	dataDir := filepath.Join(base, dataDirName)
+	if err := os.Chmod(dataDir, 0o500); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = os.Chmod(base, 0o750) })
+	t.Cleanup(func() { _ = os.Chmod(dataDir, 0o750) })
 
 	var warnings []string
 	got, err := resolvePaths("", "", func(format string, args ...any) {
